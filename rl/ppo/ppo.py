@@ -258,6 +258,7 @@ class PPOAgent:
                     v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
                     v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
+
                     # --- Final loss: policy + value - entropy ---
                     loss = pg_loss + self.cfg.vf_coef * v_loss - self.cfg.ent_coef * entropy
 
