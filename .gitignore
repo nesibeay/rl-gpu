@@ -4,6 +4,7 @@ __pycache__/
 *.so
 *.pyd
 *.pyo
+*.pyc
 
 # venvs
 .venv/
