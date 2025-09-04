@@ -1,0 +1,27 @@
+env_id: CartPole-v1
+seed: 1
+
+# batch/optimization
+num_envs: 16          # total batch = num_envs * rollout_steps = 2048
+rollout_steps: 128
+n_epochs: 4           # fewer epochs prevents overfitting small batches
+minibatch_size: 256
+
+# RL coefficients
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+ent_coef: 0.005        # now actually used in the loss
+vf_coef: 0.5
+max_grad_norm: 0.5
+
+# optimizer
+lr: 0.00025           # 2.5e-4 works well on CartPole
+anneal_lr: true
+
+# runtime
+device: auto
+vector_env: sync     # try async; if your Windows CPU behaves oddly, switch to sync
+use_amp: false        # you’re on CPU; keep false (true on CUDA)
+use_compile: false
+total_timesteps: 500000

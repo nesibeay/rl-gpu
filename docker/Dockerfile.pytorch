@@ -1,0 +1,16 @@
+# Purpose: A CUDA-ready PyTorch container for training PPO with GPU on an NVIDIA machine.
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+
+# System deps
+RUN apt-get update && apt-get install -y python3 python3-pip python3-dev git && rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
+
+# PyTorch with CUDA 12.1 wheels
+RUN pip3 install --upgrade pip
+RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# RL deps
+RUN pip3 install gymnasium[classic-control]==0.29.1 numpy pyyaml matplotlib
+
+# Copy your project into the image (so train.py etc. are available)
+COPY . /workspace
