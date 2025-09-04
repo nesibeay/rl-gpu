@@ -1,7 +1,7 @@
 # File: rl/ppo/ppo.py (unified PPO)
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 
 
 import numpy as np
@@ -32,7 +32,8 @@ class PPOConfig:
     device: str = "auto" # auto|cpu|cuda|mps
     vector_env: str = "sync" # sync|async
     use_amp: bool = False
-    use_compile: bool = False
+    use_compile: bool | str = False 
+    float32_matmul_precision: str = "high"
     #add checkpoints + periodic evaluation
     save_every_updates: int = 0
     resume_from: Optional[str] = None
@@ -50,6 +51,11 @@ class PPOAgent:
         if self.cfg.device == "auto":
             if torch.cuda.is_available():
                 self.device = torch.device("cuda")
+            else:
+                self.device = torch.device(self.cfg.device)
+            # Precision hint for matmul kernels (PyTorch 2.x)
+            torch.set_float32_matmul_precision(self.cfg.float32_matmul_precision)
+
             elif getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
                 self.device = torch.device("mps")
             else:
@@ -62,9 +68,14 @@ class PPOAgent:
         obs_space = envs.single_observation_space
         action_space = envs.single_action_space
         self.policy = ActorCritic(obs_space, action_space, hidden=(64, 64)).to(self.device)
-        if self.cfg.use_compile and hasattr(torch, "compile"):
-            self.policy = torch.compile(self.policy) # type: ignore[attr-defined]
-
+        # Allow use_compile to be True/False or a mode string like "max-autotune"
+        cmode = None
+        if isinstance(self.cfg.use_compile, str) and self.cfg.use_compile:
+            cmode = self.cfg.use_compile
+        elif isinstance(self.cfg.use_compile, bool) and self.cfg.use_compile:
+            cmode = "max-autotune"
+        if cmode and hasattr(torch, "compile"):
+            self.policy = torch.compile(self.policy, mode=cmode)  # type: ignore[attr-defined]
 
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.cfg.lr, eps=1e-5)
         from torch.amp import GradScaler as AmpGradScaler
