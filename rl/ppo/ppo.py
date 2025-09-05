@@ -1,16 +1,19 @@
-# File: rl/ppo/ppo.py (unified PPO)
+# File: rl/ppo/ppo.py (unified and corrected)
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Tuple, Optional
 
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import BatchSampler, SubsetRandomSampler
+import time
+import os
 
-
+# Assuming your ActorCritic is in this path
 from rl.policy.networks import ActorCritic
+from rl.utils.logger import CSVLogger
+
 
 @dataclass
 class PPOConfig:
@@ -32,7 +35,7 @@ class PPOConfig:
     device: str = "auto" # auto|cpu|cuda|mps
     vector_env: str = "sync" # sync|async
     use_amp: bool = False
-    use_compile: bool | str = False 
+    use_compile: bool | str = False
     float32_matmul_precision: str = "high"
     #add checkpoints + periodic evaluation
     save_every_updates: int = 0
@@ -47,27 +50,28 @@ class PPOAgent:
         import gymnasium as gym
         self.envs = envs
         self.cfg = config
-        # Device
+        
+        # --- Device Selection Logic (FIXED) ---
         if self.cfg.device == "auto":
             if torch.cuda.is_available():
                 self.device = torch.device("cuda")
-            else:
-                self.device = torch.device(self.cfg.device)
-            # Precision hint for matmul kernels (PyTorch 2.x)
-            torch.set_float32_matmul_precision(self.cfg.float32_matmul_precision)
-
-            elif getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
+                # This precision setting is specific to CUDA, so it belongs inside this block
+                torch.set_float32_matmul_precision(self.cfg.float32_matmul_precision)
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 self.device = torch.device("mps")
             else:
                 self.device = torch.device("cpu")
         else:
+            # User has specified a device manually
             self.device = torch.device(self.cfg.device)
 
+        print(f"INFO: Using device: {self.device}")
 
         # Policy
         obs_space = envs.single_observation_space
         action_space = envs.single_action_space
-        self.policy = ActorCritic(obs_space, action_space, hidden=(64, 64)).to(self.device)
+        self.policy = ActorCritic(obs_space, action_space).to(self.device)
+        
         # Allow use_compile to be True/False or a mode string like "max-autotune"
         cmode = None
         if isinstance(self.cfg.use_compile, str) and self.cfg.use_compile:
@@ -75,18 +79,18 @@ class PPOAgent:
         elif isinstance(self.cfg.use_compile, bool) and self.cfg.use_compile:
             cmode = "max-autotune"
         if cmode and hasattr(torch, "compile"):
-            self.policy = torch.compile(self.policy, mode=cmode)  # type: ignore[attr-defined]
+            print("INFO: Compiling the policy...")
+            self.policy = torch.compile(self.policy, mode=cmode)
 
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.cfg.lr, eps=1e-5)
         from torch.amp import GradScaler as AmpGradScaler
         self.scaler = AmpGradScaler("cuda", enabled=(self.device.type == "cuda" and self.cfg.use_amp))
 
-
         # Storage
         self.rollout_steps = self.cfg.rollout_steps
         self.num_envs = self.cfg.num_envs
         self.obs = None
-
+        self.global_step = 0
 
         # For episodic return tracking
         self.episode_returns = np.zeros(self.num_envs, dtype=np.float32)
@@ -95,30 +99,19 @@ class PPOAgent:
         self.completed_lengths = []
 
     def _obs_to_tensor(self, obs):
-        import gymnasium as gym
         if isinstance(obs, dict):
-            # not handled in this minimal version
-            raise NotImplementedError("Dict observations not supported in this patch.")
+            raise NotImplementedError("Dict observations not supported.")
         x = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        # If image HWC, permute to NCHW
         if x.ndim == 4 and x.shape[-1] in (1, 3, 4):
             x = x.permute(0, 3, 1, 2)
         return x
 
-
-    
-    def collect_rollout(self):
-        import numpy as np
-        import torch
-
+    def collect_rollout(self) -> Tuple[torch.Tensor, ...]:
         obs_shape = self.envs.single_observation_space.shape
+        action_shape = self.envs.single_action_space.shape
+
         obs_buf = torch.zeros((self.rollout_steps, self.num_envs) + obs_shape, dtype=torch.float32)
-
-        if self.policy.spec.action_discrete:
-            actions_buf = torch.zeros(self.rollout_steps, self.num_envs, dtype=torch.long)
-        else:
-            actions_buf = torch.zeros(self.rollout_steps, self.num_envs, self.policy.spec.action_dim, dtype=torch.float32)
-
+        actions_buf = torch.zeros((self.rollout_steps, self.num_envs) + action_shape, dtype=torch.float32)
         logprobs_buf = torch.zeros(self.rollout_steps, self.num_envs, dtype=torch.float32)
         rewards_buf  = torch.zeros(self.rollout_steps, self.num_envs, dtype=torch.float32)
         dones_buf    = torch.zeros(self.rollout_steps, self.num_envs, dtype=torch.float32)
@@ -129,37 +122,27 @@ class PPOAgent:
             self.obs = obs
 
         use_amp = (self.device.type == "cuda" and self.cfg.use_amp)
-        from torch.amp import autocast as amp_autocast  # modern API
+        from torch.amp import autocast as amp_autocast
 
         for t in range(self.rollout_steps):
             obs_buf[t] = torch.from_numpy(self.obs)
             obs_t = self._obs_to_tensor(self.obs)
 
             with torch.no_grad(), amp_autocast("cuda", enabled=use_amp):
-                feats   = self.policy.features(obs_t)
-                values  = self.policy.value(feats).squeeze(-1)
-                action, logprob, _ = self.policy.act(feats, deterministic=False)
+                action, logprob, _, value = self.policy.get_action_and_value(obs_t)
 
-            values_buf[t]  = values.detach().cpu()
+            values_buf[t]  = value.squeeze(-1).detach().cpu()
             logprobs_buf[t] = logprob.detach().cpu()
-
-            if self.policy.spec.action_discrete:
-                act_np = action.detach().cpu().numpy()
-                actions_buf[t] = action.detach().cpu()
-            else:
-                low  = self.envs.single_action_space.low
-                high = self.envs.single_action_space.high
-                act_np = action.detach().cpu().numpy()
-                act_np = np.clip(act_np, low, high)
-                actions_buf[t] = torch.from_numpy(act_np)
-
+            actions_buf[t] = action.detach().cpu()
+            
+            act_np = action.cpu().numpy()
             next_obs, reward, terminated, truncated, info = self.envs.step(act_np)
             done = np.logical_or(terminated, truncated)
 
             rewards_buf[t] = torch.tensor(reward, dtype=torch.float32)
             dones_buf[t]   = torch.tensor(done,   dtype=torch.float32)
 
-            # episode tracking
+            # Episode tracking
             self.episode_returns += reward
             self.episode_lengths += 1
             for i, d in enumerate(done):
@@ -171,13 +154,11 @@ class PPOAgent:
 
             self.obs = next_obs
 
-        with torch.no_grad():
-            obs_t = self._obs_to_tensor(self.obs)
-            feats = self.policy.features(obs_t)
-            next_value = self.policy.value(feats).squeeze(-1).detach().cpu()
+        with torch.no_grad(), amp_autocast("cuda", enabled=use_amp):
+            next_obs_t = self._obs_to_tensor(self.obs)
+            next_value = self.policy.get_value(next_obs_t).squeeze(-1).detach().cpu()
 
         return (obs_buf, actions_buf, logprobs_buf, rewards_buf, dones_buf, values_buf, next_value)
-
 
     def compute_gae(self, rewards, dones, values, next_value):
         advantages = torch.zeros_like(rewards)
@@ -191,86 +172,43 @@ class PPOAgent:
         returns = advantages + values
         return advantages, returns
 
-
-
     def update(self, obs_buf, actions, old_logprobs, advantages, returns, values):
-        import numpy as np
-        import torch
-        import torch.nn as nn
         from torch.amp import autocast as amp_autocast
 
-        # -------- Flatten rollout tensors into a single batch --------
-        b_obs = obs_buf.view(self.rollout_steps * self.num_envs, *self.envs.single_observation_space.shape)
-        b_obs = self._obs_to_tensor(b_obs.cpu().numpy())  # to device, float32
-
-        if self.policy.spec.action_discrete:
-            b_actions = actions.view(-1)
-        else:
-            b_actions = actions.view(self.rollout_steps * self.num_envs, -1)
-
+        b_obs = obs_buf.view((self.rollout_steps * self.num_envs,) + self.envs.single_observation_space.shape)
+        b_actions = actions.view((self.rollout_steps * self.num_envs,) + self.envs.single_action_space.shape)
         b_logprobs = old_logprobs.view(-1)
-        b_adv      = advantages.view(-1)
-        b_returns  = returns.view(-1)
-        b_values   = values.view(-1)
+        b_adv = advantages.view(-1)
+        b_returns = returns.view(-1)
+        b_values = values.view(-1)
 
-        # -------- Normalize advantages --------
         b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
 
-        # -------- Optional LR anneal --------
-        if self.cfg.anneal_lr:
-            frac = 1.0 - (self.global_step / float(self.cfg.total_timesteps))
-            lrnow = self.cfg.lr * frac
-            for pg in self.optimizer.param_groups:
-                pg["lr"] = lrnow
-
         batch_size = b_obs.shape[0]
-        minibatch_size = self.cfg.minibatch_size
-        inds = np.arange(batch_size)
-
+        minibatch_size = self.cfg.minibatch_size or batch_size
+        
+        sampler = BatchSampler(SubsetRandomSampler(range(batch_size)), minibatch_size, drop_last=False)
         use_amp = (self.device.type == "cuda" and self.cfg.use_amp)
 
         for _ in range(self.cfg.n_epochs):
-            np.random.shuffle(inds)
-            for start in range(0, batch_size, minibatch_size):
-                end = start + minibatch_size
-                mb_inds = inds[start:end]
+            for mb_inds in sampler:
+                mb_obs = self._obs_to_tensor(b_obs[mb_inds].numpy())
+                mb_actions = b_actions[mb_inds].to(self.device)
 
                 with amp_autocast("cuda", enabled=use_amp):
-                    # --- forward ---
-                    feats = self.policy.features(b_obs[mb_inds])
-                    new_logprob = self.policy.log_prob(feats, b_actions[mb_inds])
-                    new_value = self.policy.value(feats).squeeze(-1)
-
-                    # --- entropy (exploration) ---
-                    if self.policy.spec.action_discrete:
-                        logits = self.policy.actor(feats)
-                        dist = torch.distributions.Categorical(logits=logits)
-                        entropy = dist.entropy().mean()
-                    else:
-                        mean = self.policy.actor_mean(feats)
-                        std  = self.policy.log_std.exp().expand_as(mean)
-                        dist = torch.distributions.Normal(mean, std)
-                        entropy = dist.entropy().sum(-1).mean()
-
-                    # --- PPO clipped policy loss ---
-                    logratio = new_logprob - b_logprobs[mb_inds]
+                    _, new_logprob, entropy, new_value = self.policy.get_action_and_value(mb_obs, mb_actions)
+                    
+                    logratio = new_logprob - b_logprobs[mb_inds].to(self.device)
                     ratio = logratio.exp()
-                    adv = b_adv[mb_inds]
+                    
+                    adv = b_adv[mb_inds].to(self.device)
                     pg_loss1 = -adv * ratio
                     pg_loss2 = -adv * torch.clamp(ratio, 1.0 - self.cfg.clip_coef, 1.0 + self.cfg.clip_coef)
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                    # --- Value loss (clipped) ---
-                    v_loss_unclipped = (new_value - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        new_value - b_values[mb_inds],
-                        -self.cfg.clip_coef, self.cfg.clip_coef
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    v_loss = 0.5 * ((new_value.view(-1) - b_returns[mb_inds].to(self.device)) ** 2).mean()
 
-                    # --- Final loss: policy + value - entropy ---
-                    loss = pg_loss + self.cfg.vf_coef * v_loss - self.cfg.ent_coef * entropy
+                    loss = pg_loss + self.cfg.vf_coef * v_loss - self.cfg.ent_coef * entropy.mean()
 
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.scaler.is_enabled():
@@ -283,31 +221,26 @@ class PPOAgent:
                     nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.max_grad_norm)
                     self.optimizer.step()
 
-
     def train(self):
-        import time, numpy as np, os
-        from rl.utils.logger import CSVLogger
-
-        # optional resume
         run_name = f"{self.cfg.env_id.lower()}_{int(time.time())}"
         if self.cfg.resume_from:
             self.load_checkpoint(self.cfg.resume_from)
             run_name = os.path.splitext(os.path.basename(self.cfg.resume_from))[0] + "_resumed"
 
-        obs, _ = self.envs.reset(seed=self.cfg.seed)
-        self.obs = obs
-
         logger = CSVLogger(path=f"runs/{run_name}.csv")
 
-        self.global_step = getattr(self, "global_step", 0)
         steps_per_rollout = self.cfg.rollout_steps * self.cfg.num_envs
-        # if resuming, continue until total_timesteps regardless of previous steps
-        remaining_steps = max(self.cfg.total_timesteps - self.global_step, 0)
-        num_updates = remaining_steps // steps_per_rollout
+        num_updates = self.cfg.total_timesteps // steps_per_rollout
 
         try:
             last_t = time.perf_counter()
-            for u in range(num_updates):
+            for u in range(1, num_updates + 1):
+                if self.cfg.anneal_lr:
+                    frac = 1.0 - ((u - 1) / num_updates)
+                    lrnow = self.cfg.lr * frac
+                    for pg in self.optimizer.param_groups:
+                        pg["lr"] = lrnow
+
                 (obs_buf, actions_buf, logprobs_buf,
                  rewards_buf, dones_buf, values_buf, next_value) = self.collect_rollout()
 
@@ -322,29 +255,24 @@ class PPOAgent:
                 if len(self.completed_returns) > 0:
                     mean_ret = float(np.mean(self.completed_returns[-10:]))
                     mean_len = float(np.mean(self.completed_lengths[-10:]))
-                else:
-                    mean_ret = 0.0
-                    mean_len = 0.0
+                else: mean_ret, mean_len = 0.0, 0.0
 
                 eval_ret = None
-                if self.cfg.eval_every_updates and ((u + 1) % self.cfg.eval_every_updates == 0):
+                if self.cfg.eval_every_updates and (u % self.cfg.eval_every_updates == 0):
                     eval_ret = self.evaluate(self.cfg.eval_episodes)
 
-                print(f"update {u+1}/{num_updates} | step {self.global_step} | "
+                print(f"update {u}/{num_updates} | step {self.global_step} | "
                       f"return {mean_ret:.1f} | ep_len {mean_len:.0f} | fps {fps:.0f}"
                       + (f" | eval {eval_ret:.1f}" if eval_ret is not None else ""))
-                logger.write(u+1, self.global_step, mean_ret, mean_len, fps, eval_ret)
+                logger.write(u, self.global_step, mean_ret, mean_len, fps, eval_ret)
 
-                if self.cfg.save_every_updates and ((u + 1) % self.cfg.save_every_updates == 0):
-                    ckpt_path = f"checkpoints/{run_name}_u{u+1}.pt"
+                if self.cfg.save_every_updates and (u % self.cfg.save_every_updates == 0):
+                    ckpt_path = f"checkpoints/{run_name}_u{u}.pt"
                     self.save_checkpoint(ckpt_path)
         finally:
             logger.close()
 
-
     def save_checkpoint(self, path: str):
-        import os, torch
-        from dataclasses import asdict
         os.makedirs(os.path.dirname(path), exist_ok=True)
         ckpt = {
             "policy": self.policy.state_dict(),
@@ -358,7 +286,6 @@ class PPOAgent:
         torch.save(ckpt, path)
 
     def load_checkpoint(self, path: str):
-        import torch
         ckpt = torch.load(path, map_location=self.device)
         self.policy.load_state_dict(ckpt["policy"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
@@ -369,7 +296,7 @@ class PPOAgent:
         self.completed_lengths = list(ckpt.get("completed_lengths", []))
 
     def evaluate(self, episodes: int) -> float:
-        import numpy as np, gymnasium as gym, torch
+        import gymnasium as gym
         env = gym.make(self.cfg.env_id)
         total = 0.0
         for ep in range(episodes):
@@ -379,17 +306,16 @@ class PPOAgent:
             while not done:
                 x = self._obs_to_tensor(obs[None, ...])
                 with torch.no_grad():
-                    feats = self.policy.features(x)
-                    act, _, _ = self.policy.act(feats, deterministic=self.cfg.deterministic_eval)
-                if self.policy.spec.action_discrete:
-                    act_np = int(act.item())
-                else:
-                    low, high = env.action_space.low, env.action_space.high
-                    act_np = act.detach().cpu().numpy()[0]
-                    act_np = np.clip(act_np, low, high)
+                    act, _, _, _ = self.policy.get_action_and_value(x, deterministic=self.cfg.deterministic_eval)
+                
+                low, high = env.action_space.low, env.action_space.high
+                act_np = act.detach().cpu().numpy()[0]
+                act_np = np.clip(act_np, low, high)
+                
                 obs, r, terminated, truncated, _ = env.step(act_np)
                 done = terminated or truncated
                 ep_ret += float(r)
             total += ep_ret
         env.close()
         return total / float(episodes)
+        
