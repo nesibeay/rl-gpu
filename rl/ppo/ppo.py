@@ -4,6 +4,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
+from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
 import torch
@@ -355,7 +356,7 @@ class PPO:
                 if lr_anneal:
                     writer.add_scalar("charts/learning_rate", opt.param_groups[0]["lr"], gstep)
 
-                    
+
             # ===== bootstrap & GAE =====
             with torch.no_grad():
                 flat_obs = next_obs.view(num_envs, -1)
