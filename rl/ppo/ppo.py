@@ -22,6 +22,7 @@ class PPOConfig:
     seed: int = 1
     total_timesteps: int = 300_000
     device: Optional[str] = None
+    mode: str = "ppo" 
 
     # vec env params
     num_envs: int = 16
@@ -290,9 +291,13 @@ class PPO:
         next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
         next_done = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
 
-        ep_returns, ep_lengths = [], []
-        ep_ret_env = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
-        ep_len_env = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
+        # Track episodic returns/lengths (scaled + raw)
+        ep_returns = []        # scaled by reward_scale
+        raw_ep_returns = []    # raw Gym rewards
+        ep_lengths = []
+        ep_ret_env = torch.zeros(num_envs, dtype=torch.float32, device=dev)
+        raw_ep_ret_env = torch.zeros(num_envs, dtype=torch.float32, device=dev)
+        ep_len_env = torch.zeros(num_envs, dtype=torch.float32, device=dev)
 
         start = time.time()
         gstep = 0
@@ -318,33 +323,44 @@ class PPO:
                 o2, r, terminated, truncated, _ = venv.step(env_a)
                 done = np.logical_or(terminated, truncated)
 
-                if reward_scale != 1.0:
-                    r = np.asarray(r, dtype=np.float32) * reward_scale
+                # Dual streams
+                raw_r = np.asarray(r, dtype=np.float32)
+                scaled_r = raw_r * reward_scale if reward_scale != 1.0 else raw_r
 
-                ep_ret_env += torch.as_tensor(r, device=self.device, dtype=torch.float32)
-                ep_len_env += 1
+
+                ep_ret_env     += torch.as_tensor(scaled_r, device=self.device, dtype=torch.float32)
+                raw_ep_ret_env += torch.as_tensor(raw_r,    device=self.device, dtype=torch.float32)
+                ep_len_env     += 1
                 for i in range(num_envs):
                     if done[i]:
-                        ep_returns.append(float(ep_ret_env[i].item()))
+                        ep_returns.append(float(ep_ret_env[i].item()))         # scaled
+                        raw_ep_returns.append(float(raw_ep_ret_env[i].item())) # raw
                         ep_lengths.append(int(ep_len_env[i].item()))
                         ep_ret_env[i] = 0.0
+                        raw_ep_ret_env[i] = 0.0
                         ep_len_env[i] = 0.0
+
 
                 obs_buf[t] = flat_obs
                 act_buf[t] = a
                 logp_buf[t] = logp
                 val_buf[t] = v
-                rew_buf[t] = torch.as_tensor(r, device=self.device, dtype=torch.float32)
-                done_buf[t] = next_done
+                rew_buf[t] = torch.as_tensor(scaled_r, device=self.device, dtype=torch.float32)
+                done_buf[t] = torch.as_tensor(done, dtype=torch.float32,device=self.device)
+
 
                 next_obs = torch.as_tensor(o2, dtype=torch.float32, device=self.device)
                 next_done = torch.as_tensor(done, dtype=torch.float32, device=self.device)
 
             # log
             fps = int(gstep / max(time.time() - start, 1e-6))
-            disp_ret = (np.mean(ep_returns[-10:]) if len(ep_returns) else float("nan"))
-            disp_len = (np.mean(ep_lengths[-10:]) if len(ep_lengths) else float("nan"))
-            print(f"step {gstep:8d} | ep_ret {disp_ret:8.1f} | ep_len {disp_len:6.1f} | fps {fps}")
+            disp_ret =  (np.mean(ep_returns[-10:])     if ep_returns     else float("nan"))
+            disp_raw =  (np.mean(raw_ep_returns[-10:]) if raw_ep_returns else float("nan"))
+            disp_len =  (np.mean(ep_lengths[-10:])     if ep_lengths     else float("nan"))
+            print(
+                f"step {gstep:8d} | ep_ret {disp_ret:7.1f} (raw {disp_raw:7.1f}) "
+                f"| ep_len {disp_len:6.1f} | fps {fps}"
+            )
 
 
             # 2. ADD THE TENSORBOARD LOGGING LOGIC HERE
