@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Dict
+from dataclasses import dataclass, fields
+from typing import Dict, Optional, Union, Tuple
 
 import numpy as np
 import torch
@@ -41,7 +41,7 @@ def select_device(name: str) -> torch.device:
 @dataclass
 class PPOConfig:
     env_id: str = "Pendulum-v1"
-    hidden_sizes: tuple = (64, 64)
+    hidden_sizes: Tuple[int, ...] = (64, 64)
     seed: int = 1
     total_timesteps: int = 300_000
     num_envs: int = 16
@@ -59,7 +59,10 @@ class PPOConfig:
     device: str = "auto"
     vector_env: str = "sync"  # "sync" | "async"
     use_amp: bool = False
-    use_compile: bool = False
+    # allow either bool or string mode like "max-autotune"
+    use_compile: Union[bool, str] = False
+    # optional extra perf knob from YAML; ignored if None
+    float32_matmul_precision: Optional[str] = None
 
 
 # -----------------------------
@@ -87,7 +90,7 @@ class RolloutBuffer:
         elif mode == "discrete":
             self.actions = torch.zeros((size, num_envs), dtype=torch.long, device=device)
         else:
-            raise ValueError("Unknown mode for buffer: {mode}")
+            raise ValueError(f"Unknown mode for buffer: {mode}")
 
     def get_flat(self):
         def flat(x):
@@ -102,9 +105,9 @@ class RolloutBuffer:
             "values": flat(self.values),
         }
         if self.mode == "continuous":
-            out["actions"] = flat(self.actions)  # (B, act_dim)
+            out["actions"] = flat(self.actions)
         else:
-            out["actions"] = flat(self.actions).long()  # (B,)
+            out["actions"] = flat(self.actions).long()
         return out
 
 
@@ -120,7 +123,7 @@ class PPO:
         # Env & spaces
         self.env = make_vec_env(cfg.env_id, cfg.num_envs, cfg.seed, cfg.vector_env)
         obs, _ = self.env.reset(seed=cfg.seed)
-        self.obs_shape = obs.shape[1:]  # vector obs shape (for Box obs)
+        self.obs_shape = obs.shape[1:]  # (obs_dim,)
         single_act = self.env.single_action_space
 
         # Policy by action space
@@ -139,12 +142,12 @@ class PPO:
         else:
             raise ValueError("Unsupported action space type.")
 
+        # Optional compile (PyTorch 2)
         if cfg.use_compile and hasattr(torch, "compile"):
             compile_kwargs = {}
             if isinstance(cfg.use_compile, str):
                 compile_kwargs["mode"] = cfg.use_compile  # e.g., "max-autotune"
             self.net = torch.compile(self.net, **compile_kwargs)
-
 
         self.optimizer = optim.Adam(self.net.parameters(), lr=cfg.lr, eps=1e-5)
 
@@ -160,19 +163,17 @@ class PPO:
     # -----------------
     def _obs_to_tensor(self, obs: np.ndarray) -> torch.Tensor:
         x = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        if x.dim() > 2:  # images or other
+        if x.dim() > 2:
             x = x.view(x.size(0), -1)
         return x
 
     def _scale_action(self, a_tanh: torch.Tensor) -> torch.Tensor:
-        # Map from [-1,1] to [low, high]
         return self.act_low + (a_tanh + 1.0) * 0.5 * (self.act_high - self.act_low)
 
     def _compute_gae(self, buffer: RolloutBuffer, last_value: torch.Tensor):
         cfg = self.cfg
         gae = torch.zeros(buffer.rewards.size(1), device=self.device)
         for t in reversed(range(cfg.rollout_steps)):
-            # Time-limit bootstrap: only 'terminated' stops bootstrap
             not_done = (~buffer.terminated[t]).float()
             next_values = last_value if t == cfg.rollout_steps - 1 else buffer.values[t + 1]
             delta = buffer.rewards[t] + cfg.gamma * next_values * not_done - buffer.values[t]
@@ -189,12 +190,10 @@ class PPO:
         flat = buffer.get_flat()
         b_inds = np.arange(B)
 
-        # Normalize advantages
         adv = flat["advantages"]
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         flat["advantages"] = adv
 
-        # Anneal LR
         if cfg.anneal_lr:
             frac = 1.0 - (self.global_step / max(cfg.total_timesteps, 1))
             lr = cfg.lr * frac
@@ -215,18 +214,15 @@ class PPO:
                     actions_b = flat["actions"][b_inds[mb]]  # (MB, act_dim)
                     mean, std = self.net.dist_params(obs_b)
                     normal = torch.distributions.Normal(mean, std)
-
-                    # logprob for *already squashed* actions: u = atanh(a)
                     eps = 1e-6
                     a_clipped = torch.clamp(actions_b, -1 + eps, 1 - eps)
                     u = 0.5 * (torch.log1p(a_clipped) - torch.log1p(-a_clipped))  # atanh
                     log_prob_u = normal.log_prob(u).sum(-1)
                     correction = torch.log(1 - a_clipped.pow(2) + eps).sum(-1)
                     logp = log_prob_u - correction
-
                     entropy = normal.entropy().sum(-1).mean()
                 else:
-                    actions_b = flat["actions"][b_inds[mb]].long()  # (MB,)
+                    actions_b = flat["actions"][b_inds[mb]].long()
                     logits, _ = self.net.forward(obs_b)
                     dist = torch.distributions.Categorical(logits=logits)
                     logp = dist.log_prob(actions_b)
@@ -275,7 +271,6 @@ class PPO:
                         logp = log_prob_u - correction
                         actions_env = self._scale_action(a_tanh)
                         v = self.net.value(x)
-
                         buffer.actions[t] = a_tanh
                     else:
                         logits, v = self.net.forward(x)
@@ -290,13 +285,16 @@ class PPO:
                     buffer.values[t] = v
 
                 # Step env
-                act_np = actions_env.squeeze(0).cpu().numpy() if actions_env.dim() == 2 else actions_env.cpu().numpy()
-                next_obs, reward, terminated, truncated, info = self.env.step(act_np)
+                act = actions_env
+                if isinstance(act, torch.Tensor):
+                    act_np = act.cpu().numpy()
+                else:
+                    act_np = act
+                next_obs, reward, terminated, truncated, _ = self.env.step(act_np)
                 buffer.rewards[t] = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
                 buffer.terminated[t] = torch.as_tensor(terminated, dtype=torch.bool, device=self.device)
                 buffer.truncated[t] = torch.as_tensor(truncated, dtype=torch.bool, device=self.device)
 
-                # Episode stats
                 self.episode_returns += reward
                 self.episode_lengths += 1
                 for i in range(cfg.num_envs):
@@ -318,7 +316,6 @@ class PPO:
             self._compute_gae(buffer, last_value)
             self._update(buffer, epoch=self.global_step // (cfg.rollout_steps * cfg.num_envs))
 
-            # Logging
             if self.completed_returns:
                 mean_r = float(np.mean(self.completed_returns[-10:]))
                 mean_l = float(np.mean(self.completed_lengths[-10:]))

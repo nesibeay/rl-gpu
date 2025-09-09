@@ -1,8 +1,7 @@
 # train.py — unified entrypoint for PPO (supports continuous + discrete)
-import argparse, yaml, torch, numpy as np, random
+import argparse, yaml, torch, numpy as np, random, dataclasses
 
 from rl.ppo.ppo import PPO, PPOConfig
-import gymnasium as gym
 
 
 def set_seed(seed: int):
@@ -21,12 +20,19 @@ def main():
     with open(args.config, "r") as f:
         cfg_dict = yaml.safe_load(f)
 
-    cfg = PPOConfig(**cfg_dict)
+    # Filter out unknown YAML keys so PPOConfig(**...) never crashes
+    valid_keys = {f.name for f in dataclasses.fields(PPOConfig)}
+    filtered = {k: v for k, v in cfg_dict.items() if k in valid_keys}
+    extras = {k: v for k, v in cfg_dict.items() if k not in valid_keys}
+    if extras:
+        print("[train] Ignoring extra config keys:", sorted(extras.keys()))
+
+    cfg = PPOConfig(**filtered)
+
     # Optional: honor float32_matmul_precision from YAML (useful on NVIDIA GPUs)
     prec = getattr(cfg, "float32_matmul_precision", None)
     if prec:
         try:
-            import torch
             torch.set_float32_matmul_precision(str(prec))
             print("Set torch.float32 matmul precision ->", prec)
         except Exception as e:
@@ -34,8 +40,6 @@ def main():
 
     set_seed(cfg.seed)
 
-    # We now support both continuous and discrete envs; no early exit.
-    # (train will auto-detect the action space and build the right head.)
     agent = PPO(cfg)
     stats = agent.train()
 
