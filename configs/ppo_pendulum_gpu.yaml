@@ -19,6 +19,7 @@ max_grad_norm: 0.5
 actor_hidden_sizes: [64, 64]
 critic_hidden_sizes: [64, 64]
 activation: tanh
+init_log_std: -0.5
 
 lr: 2.0e-4                      # slightly lower when parallelism ↑
 lr_anneal: linear

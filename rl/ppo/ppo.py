@@ -1,331 +1,532 @@
-# rl/ppo/ppo.py — unified PPO (continuous + discrete)
-from __future__ import annotations
-
+# rl/ppo/ppo.py
+import math
+import os
 import time
-from dataclasses import dataclass, fields
-from typing import Dict, Optional, Union, Tuple
+from dataclasses import dataclass
+from typing import Tuple, Optional, Dict, Any
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
+
 import gymnasium as gym
 from gymnasium.spaces import Box, Discrete
 
-from rl.utils.envs import make_vec_env
-from rl.policy.networks import (
-    ActorCriticContinuous,
-    ActorCriticDiscrete,
-)
+# ----------------------------
+# Utilities
+# ----------------------------
 
+def device_of(cfg: Dict[str, Any]) -> torch.device:
+    dev = cfg.get("device", None)
+    if dev is not None:
+        return torch.device(dev)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# -----------------------------
-# Utils
-# -----------------------------
+def set_tf32_guard(cfg: Dict[str, Any]):
+    # Only on CUDA
+    if torch.cuda.is_available() and cfg.get("float32_matmul_precision", "") == "high":
+        try:
+            torch.set_float32_matmul_precision("high")  # enables TF32 path where applicable
+            print("Set torch.float32 matmul precision -> high")
+        except Exception as e:
+            print(f"[warn] set_float32_matmul_precision failed: {e}")
 
-def select_device(name: str) -> torch.device:
-    name = (name or "auto").lower()
-    if name == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    return torch.device(name)
+def maybe_compile(module: nn.Module, enable: bool) -> nn.Module:
+    if enable and torch.cuda.is_available():
+        try:
+            module = torch.compile(module)
+            print("[compile] torch.compile enabled for module")
+        except Exception as e:
+            print(f"[warn] torch.compile failed: {e}")
+    return module
 
+class RunningNorm:
+    """
+    Running mean/var normalizer. Keeps buffers on chosen device.
+    """
+    def __init__(self, shape, eps=1e-8, device="cpu"):
+        self.mean = torch.zeros(shape, device=device)
+        self.var = torch.ones(shape, device=device)
+        self.count = torch.tensor(eps, device=device)
+        self.eps = eps
 
-# -----------------------------
-# Config
-# -----------------------------
+    @torch.no_grad()
+    def update(self, x: torch.Tensor):
+        # x: [B, obs_dim]
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        b = x.shape[0]
+        if b == 0:
+            return
+        m = x.mean(0)
+        v = x.var(0, unbiased=False)
+        tot = self.count + b
+        delta = m - self.mean
+        new_mean = self.mean + delta * (b / tot)
+        new_var = (self.var * self.count + v * b + delta.pow(2) * self.count * b / tot) / tot
+        self.mean, self.var, self.count = new_mean, new_var.clamp_min(self.eps), tot
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / (self.var.sqrt() + 1e-8)
+
+# ----------------------------
+# Policy / Value Nets
+# ----------------------------
+
+def mlp(sizes, activation="tanh", out_act=None):
+    acts = {
+        "tanh": nn.Tanh,
+        "relu": nn.ReLU,
+        "elu": nn.ELU,
+        "gelu": nn.GELU,
+    }
+    layers = []
+    for i in range(len(sizes) - 1):
+        layers.append(nn.Linear(sizes[i], sizes[i+1]))
+        if i < len(sizes) - 2:
+            layers.append(acts.get(activation, nn.Tanh)())
+        elif out_act:
+            layers.append(out_act())
+    return nn.Sequential(*layers)
+
+class ActorContinuous(nn.Module):
+    """
+    Tanh-squashed Gaussian with log-prob correction (Appendix C of SAC / PPO conventions).
+    """
+    def __init__(self, obs_dim, act_dim, hidden, activation="tanh", init_log_std=-0.5):
+        super().__init__()
+        self.net = mlp([obs_dim] + hidden + [act_dim], activation=activation)
+        self.log_std = nn.Parameter(torch.full((act_dim,), float(init_log_std)))
+
+    def forward(self, obs):
+        mu = self.net(obs)
+        std = torch.exp(self.log_std).clamp_min(1e-6)
+        return mu, std
+
+    def sample(self, obs):
+        mu, std = self(obs)
+        dist = torch.distributions.Normal(mu, std)
+        u = dist.rsample()
+        a = torch.tanh(u)
+        # Change of variables (tanh)
+        log_prob = dist.log_prob(u) - torch.log(1 - a.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1)
+        return a, log_prob, mu, std
+
+    def log_prob(self, obs, actions):
+        # inverse tanh: clip to avoid NaN
+        atanh = torch.atanh(actions.clamp(-0.999999, 0.999999))
+        mu, std = self(obs)
+        dist = torch.distributions.Normal(mu, std)
+        lp = dist.log_prob(atanh) - torch.log(1 - actions.pow(2) + 1e-6)
+        return lp.sum(-1)
+
+class ActorDiscrete(nn.Module):
+    def __init__(self, obs_dim, n_act, hidden, activation="tanh"):
+        super().__init__()
+        self.net = mlp([obs_dim] + hidden + [n_act], activation=activation)
+
+    def forward(self, obs):
+        logits = self.net(obs)
+        return logits
+
+    def sample(self, obs):
+        logits = self(obs)
+        dist = torch.distributions.Categorical(logits=logits)
+        a = dist.sample()
+        log_prob = dist.log_prob(a)
+        return a, log_prob, logits, None
+
+    def log_prob(self, obs, actions):
+        logits = self(obs)
+        dist = torch.distributions.Categorical(logits=logits)
+        return dist.log_prob(actions)
+
+class Critic(nn.Module):
+    def __init__(self, obs_dim, hidden, activation="tanh"):
+        super().__init__()
+        self.v = mlp([obs_dim] + hidden + [1], activation=activation)
+
+    def forward(self, obs):
+        return self.v(obs).squeeze(-1)
+
+class ActorCritic(nn.Module):
+    def __init__(self, obs_space, act_space, cfg):
+        super().__init__()
+        obs_dim = int(np.prod(obs_space.shape))
+        hidden_actor = list(cfg.get("actor_hidden_sizes", [64, 64]))
+        hidden_critic = list(cfg.get("critic_hidden_sizes", [64, 64]))
+        activation = cfg.get("activation", "tanh")
+        self.is_continuous = isinstance(act_space, Box)
+
+        if self.is_continuous:
+            act_dim = int(np.prod(act_space.shape))
+            self.actor = ActorContinuous(obs_dim, act_dim, hidden_actor, activation, init_log_std=cfg.get("init_log_std", -0.5))
+        else:
+            assert isinstance(act_space, Discrete), "Only Box or Discrete action spaces are supported"
+            self.actor = ActorDiscrete(obs_dim, act_space.n, hidden_actor, activation)
+        self.critic = Critic(obs_dim, hidden_critic, activation)
+
+        # action bounds if continuous
+        self.action_low = None
+        self.action_high = None
+        if self.is_continuous:
+            # Pendulum: [-2, 2]
+            self.action_low = torch.as_tensor(act_space.low, dtype=torch.float32)
+            self.action_high = torch.as_tensor(act_space.high, dtype=torch.float32)
+
+    def forward(self, obs):
+        raise NotImplementedError
+
+    def act(self, obs):
+        if self.is_continuous:
+            a, logp, mu, std = self.actor.sample(obs)
+            return a, logp
+        else:
+            a, logp, _, _ = self.actor.sample(obs)
+            return a, logp
+
+    def evaluate_actions(self, obs, actions):
+        if self.is_continuous:
+            logp = self.actor.log_prob(obs, actions)
+        else:
+            logp = self.actor.log_prob(obs, actions)
+        v = self.critic(obs)
+        return logp, v
+
+# ----------------------------
+# Buffer
+# ----------------------------
 
 @dataclass
-class PPOConfig:
-    env_id: str = "Pendulum-v1"
-    hidden_sizes: Tuple[int, ...] = (64, 64)
-    seed: int = 1
-    total_timesteps: int = 300_000
-    num_envs: int = 16
-    rollout_steps: int = 256
-    n_epochs: int = 10
-    minibatch_size: int = 2048
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    clip_coef: float = 0.2
-    ent_coef: float = 0.0
-    vf_coef: float = 0.5
-    max_grad_norm: float = 0.5
-    lr: float = 3e-4
-    anneal_lr: bool = True
-    device: str = "auto"
-    vector_env: str = "sync"  # "sync" | "async"
-    use_amp: bool = False
-    # allow either bool or string mode like "max-autotune"
-    use_compile: Union[bool, str] = False
-    # optional extra perf knob from YAML; ignored if None
-    float32_matmul_precision: Optional[str] = None
+class RolloutStorage:
+    obs: torch.Tensor
+    actions: torch.Tensor
+    logprobs: torch.Tensor
+    rewards: torch.Tensor
+    dones: torch.Tensor
+    values: torch.Tensor
 
+    def to(self, device):
+        self.obs = self.obs.to(device)
+        self.actions = self.actions.to(device)
+        self.logprobs = self.logprobs.to(device)
+        self.rewards = self.rewards.to(device)
+        self.dones = self.dones.to(device)
+        self.values = self.values.to(device)
+        return self
 
-# -----------------------------
-# Buffers
-# -----------------------------
+# ----------------------------
+# Env helpers
+# ----------------------------
 
-class RolloutBuffer:
-    def __init__(self, obs_shape, act_dim: int, size: int, num_envs: int, device: torch.device, mode: str):
-        self.mode = mode
-        self.device = device
-        self.size = size
-        self.num_envs = num_envs
+def make_env(env_id: str, seed: int, idx: int, capture_video: bool = False):
+    def thunk():
+        env = gym.make(env_id)
+        env.reset(seed=seed + idx)
+        return env
+    return thunk
 
-        self.obs = torch.zeros((size, num_envs) + obs_shape, dtype=torch.float32, device=device)
-        self.logprobs = torch.zeros((size, num_envs), dtype=torch.float32, device=device)
-        self.rewards = torch.zeros((size, num_envs), dtype=torch.float32, device=device)
-        self.terminated = torch.zeros((size, num_envs), dtype=torch.bool, device=device)
-        self.truncated = torch.zeros((size, num_envs), dtype=torch.bool, device=device)
-        self.values = torch.zeros((size, num_envs), dtype=torch.float32, device=device)
-        self.advantages = torch.zeros((size, num_envs), dtype=torch.float32, device=device)
-        self.returns = torch.zeros((size, num_envs), dtype=torch.float32, device=device)
+def action_postproc(ac: torch.Tensor, model: ActorCritic) -> torch.Tensor:
+    # scale continuous actions to env bounds; discrete actions pass through
+    if model.is_continuous:
+        # actions are in [-1, 1] due to tanh; rescale to env range
+        if model.action_low is None or model.action_high is None:
+            return ac
+        low = model.action_low.to(ac.device)
+        high = model.action_high.to(ac.device)
+        # map [-1,1] -> [low, high]
+        return low + (0.5 * (ac + 1.0)) * (high - low)
+    else:
+        return ac
 
-        if mode == "continuous":
-            self.actions = torch.zeros((size, num_envs, act_dim), dtype=torch.float32, device=device)
-        elif mode == "discrete":
-            self.actions = torch.zeros((size, num_envs), dtype=torch.long, device=device)
-        else:
-            raise ValueError(f"Unknown mode for buffer: {mode}")
+# ----------------------------
+# Training
+# ----------------------------
 
-    def get_flat(self):
-        def flat(x):
-            if x.dim() > 2:
-                return x.reshape(-1, *x.shape[2:])
-            return x.reshape(-1)
-        out = {
-            "obs": flat(self.obs),
-            "logprobs": flat(self.logprobs),
-            "returns": flat(self.returns),
-            "advantages": flat(self.advantages),
-            "values": flat(self.values),
-        }
-        if self.mode == "continuous":
-            out["actions"] = flat(self.actions)
-        else:
-            out["actions"] = flat(self.actions).long()
-        return out
+def train(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Main PPO training loop. Expects `cfg` dict with keys such as:
+      - env_id, seed, total_timesteps
+      - num_envs, rollout_steps, n_epochs, minibatch_size
+      - lr, gamma, gae_lambda, clip_coef, vf_clip_coef, vf_coef, ent_coef, max_grad_norm
+      - reward_scale, obs_norm, adv_norm, target_kl, lr_anneal
+      - use_value_clip, use_tanh_squash (kept for compatibility; squash is on for continuous)
+      - use_compile, float32_matmul_precision
+    """
+    # --- Device & matmul precision guards ---
+    dev = device_of(cfg)
+    set_tf32_guard(cfg)
+    use_compile = bool(cfg.get("use_compile", False)) and torch.cuda.is_available()
 
+    # --- Build vectorized env ---
+    env_id = cfg.get("env_id", "Pendulum-v1")
+    seed = int(cfg.get("seed", 1))
+    num_envs = int(cfg.get("num_envs", 16))
+    rollout_steps = int(cfg.get("rollout_steps", 256))
+    total_timesteps = int(cfg.get("total_timesteps", 300_000))
 
-# -----------------------------
-# PPO
-# -----------------------------
+    venv = gym.vector.SyncVectorEnv([make_env(env_id, seed, i) for i in range(num_envs)])
+    obs_space, act_space = venv.single_observation_space, venv.single_action_space
 
-class PPO:
-    def __init__(self, cfg: PPOConfig):
-        self.cfg = cfg
-        self.device = select_device(cfg.device)
+    # --- Model ---
+    ac = ActorCritic(obs_space, act_space, cfg).to(dev)
+    ac.actor = maybe_compile(ac.actor, use_compile)
+    ac.critic = maybe_compile(ac.critic, use_compile)
 
-        # Env & spaces
-        self.env = make_vec_env(cfg.env_id, cfg.num_envs, cfg.seed, cfg.vector_env)
-        obs, _ = self.env.reset(seed=cfg.seed)
-        self.obs_shape = obs.shape[1:]  # (obs_dim,)
-        single_act = self.env.single_action_space
+    # --- Optimizer ---
+    lr = float(cfg.get("lr", 3e-4))
+    optimizer = torch.optim.AdamW(ac.parameters(), lr=lr)
 
-        # Policy by action space
-        if isinstance(single_act, Box):
-            self.mode = "continuous"
-            self.act_low = torch.as_tensor(single_act.low, device=self.device, dtype=torch.float32)
-            self.act_high = torch.as_tensor(single_act.high, device=self.device, dtype=torch.float32)
-            self.act_dim = single_act.shape[0]
-            hidden = tuple(getattr(cfg, "hidden_sizes", (64, 64)))
-            self.net = ActorCriticContinuous(int(np.prod(self.obs_shape)), self.act_dim, hidden=hidden).to(self.device)
-        elif isinstance(single_act, Discrete):
-            self.mode = "discrete"
-            self.n_actions = int(single_act.n)
-            hidden = tuple(getattr(cfg, "hidden_sizes", (64, 64)))
-            self.net = ActorCriticDiscrete(int(np.prod(self.obs_shape)), self.n_actions, hidden=hidden).to(self.device)
-        else:
-            raise ValueError("Unsupported action space type.")
+    # --- PPO knobs ---
+    gamma = float(cfg.get("gamma", 0.99))
+    gae_lambda = float(cfg.get("gae_lambda", 0.95))
+    clip_coef = float(cfg.get("clip_coef", 0.2))
+    vf_clip_coef = float(cfg.get("vf_clip_coef", 0.2))
+    vf_coef = float(cfg.get("vf_coef", 0.5))
+    ent_coef = float(cfg.get("ent_coef", 0.01))
+    max_grad_norm = float(cfg.get("max_grad_norm", 0.5))
 
-        # Optional compile (PyTorch 2)
-        if cfg.use_compile and hasattr(torch, "compile"):
-            compile_kwargs = {}
-            if isinstance(cfg.use_compile, str):
-                compile_kwargs["mode"] = cfg.use_compile  # e.g., "max-autotune"
-            self.net = torch.compile(self.net, **compile_kwargs)
+    n_epochs = int(cfg.get("n_epochs", 10))
+    minibatch_size = int(cfg.get("minibatch_size", 2048))
+    target_kl = float(cfg.get("target_kl", 0.015))
+    lr_anneal = str(cfg.get("lr_anneal", ""))  # "linear" or ""
 
-        self.optimizer = optim.Adam(self.net.parameters(), lr=cfg.lr, eps=1e-5)
+    # --- Stabilizers ---
+    reward_scale = float(cfg.get("reward_scale", 1.0))
+    use_obs_norm = bool(cfg.get("obs_norm", False))
+    adv_norm = bool(cfg.get("adv_norm", True))
+    use_value_clip = bool(cfg.get("use_value_clip", True))
 
-        # Stats
-        self.global_step = 0
-        self.episode_returns = np.zeros(cfg.num_envs, dtype=np.float32)
-        self.episode_lengths = np.zeros(cfg.num_envs, dtype=np.int32)
-        self.completed_returns = []
-        self.completed_lengths = []
+    # --- Rollout buffers ---
+    obs_shape = (int(np.prod(obs_space.shape)),)
+    if isinstance(act_space, Box):
+        act_shape = (int(np.prod(act_space.shape)),)
+        act_dtype = torch.float32
+    else:
+        act_shape = ()
+        act_dtype = torch.long
 
-    # -----------------
-    # Helpers
-    # -----------------
-    def _obs_to_tensor(self, obs: np.ndarray) -> torch.Tensor:
-        x = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        if x.dim() > 2:
-            x = x.view(x.size(0), -1)
-        return x
+    buf_size = rollout_steps * num_envs
+    storage = RolloutStorage(
+        obs=torch.zeros((rollout_steps, num_envs) + obs_shape, dtype=torch.float32),
+        actions=torch.zeros((rollout_steps, num_envs) + act_shape, dtype=act_dtype),
+        logprobs=torch.zeros((rollout_steps, num_envs), dtype=torch.float32),
+        rewards=torch.zeros((rollout_steps, num_envs), dtype=torch.float32),
+        dones=torch.zeros((rollout_steps, num_envs), dtype=torch.float32),
+        values=torch.zeros((rollout_steps, num_envs), dtype=torch.float32),
+    )
 
-    def _scale_action(self, a_tanh: torch.Tensor) -> torch.Tensor:
-        return self.act_low + (a_tanh + 1.0) * 0.5 * (self.act_high - self.act_low)
+    storage = storage.to(dev)
+    obs_norm = RunningNorm(shape=obs_shape, device=dev) if use_obs_norm else None
 
-    def _compute_gae(self, buffer: RolloutBuffer, last_value: torch.Tensor):
-        cfg = self.cfg
-        gae = torch.zeros(buffer.rewards.size(1), device=self.device)
-        for t in reversed(range(cfg.rollout_steps)):
-            not_done = (~buffer.terminated[t]).float()
-            next_values = last_value if t == cfg.rollout_steps - 1 else buffer.values[t + 1]
-            delta = buffer.rewards[t] + cfg.gamma * next_values * not_done - buffer.values[t]
-            gae = delta + cfg.gamma * cfg.gae_lambda * not_done * gae
-            buffer.advantages[t] = gae
-        buffer.returns = buffer.advantages + buffer.values
+    # --- Reset envs ---
+    next_obs, _ = venv.reset(seed=seed)
+    next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=dev)
+    next_done = torch.zeros(num_envs, dtype=torch.float32, device=dev)
 
-    # -----------------
-    # Update
-    # -----------------
-    def _update(self, buffer: RolloutBuffer, epoch: int):
-        cfg = self.cfg
-        B = cfg.rollout_steps * cfg.num_envs
-        flat = buffer.get_flat()
-        b_inds = np.arange(B)
+    # Track episodic returns/lengths
+    ep_returns = []
+    ep_lengths = []
+    ep_ret_env = torch.zeros(num_envs, dtype=torch.float32, device=dev)
+    ep_len_env = torch.zeros(num_envs, dtype=torch.float32, device=dev)
 
-        adv = flat["advantages"]
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        flat["advantages"] = adv
+    # For FPS
+    start_time = time.time()
+    global_step = 0
+    log_interval = num_envs * rollout_steps  # prints per update
 
-        if cfg.anneal_lr:
-            frac = 1.0 - (self.global_step / max(cfg.total_timesteps, 1))
-            lr = cfg.lr * frac
-            for pg in self.optimizer.param_groups:
-                pg["lr"] = lr
+    # ----------------------------
+    # Main Loop
+    # ----------------------------
+    while global_step < total_timesteps:
+        # ===== Collect rollout =====
+        for t in range(rollout_steps):
+            global_step += num_envs
 
-        for _ in range(cfg.n_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, B, cfg.minibatch_size):
-                end = start + cfg.minibatch_size
-                mb = slice(start, end)
-                obs_b = flat["obs"][b_inds[mb]]
-                old_logp_b = flat["logprobs"][b_inds[mb]]
-                returns_b = flat["returns"][b_inds[mb]]
-                adv_b = flat["advantages"][b_inds[mb]]
-
-                if self.mode == "continuous":
-                    actions_b = flat["actions"][b_inds[mb]]  # (MB, act_dim)
-                    mean, std = self.net.dist_params(obs_b)
-                    normal = torch.distributions.Normal(mean, std)
-                    eps = 1e-6
-                    a_clipped = torch.clamp(actions_b, -1 + eps, 1 - eps)
-                    u = 0.5 * (torch.log1p(a_clipped) - torch.log1p(-a_clipped))  # atanh
-                    log_prob_u = normal.log_prob(u).sum(-1)
-                    correction = torch.log(1 - a_clipped.pow(2) + eps).sum(-1)
-                    logp = log_prob_u - correction
-                    entropy = normal.entropy().sum(-1).mean()
-                else:
-                    actions_b = flat["actions"][b_inds[mb]].long()
-                    logits, _ = self.net.forward(obs_b)
-                    dist = torch.distributions.Categorical(logits=logits)
-                    logp = dist.log_prob(actions_b)
-                    entropy = dist.entropy().mean()
-
-                v = self.net.value(obs_b)
-                v_clipped = v + (flat["values"][b_inds[mb]] - v).clamp(-cfg.clip_coef, cfg.clip_coef)
-                v_loss_unclipped = (v - returns_b).pow(2)
-                v_loss_clipped = (v_clipped - returns_b).pow(2)
-                v_loss = 0.5 * torch.maximum(v_loss_unclipped, v_loss_clipped).mean()
-
-                ratio = (logp - old_logp_b).exp()
-                pg_loss1 = -adv_b * ratio
-                pg_loss2 = -adv_b * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef)
-                pg_loss = torch.maximum(pg_loss1, pg_loss2).mean()
-
-                loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * entropy
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
-                self.optimizer.step()
-
-    # -----------------
-    # Train
-    # -----------------
-    def train(self) -> Dict[str, float]:
-        cfg = self.cfg
-        obs, _ = self.env.reset(seed=cfg.seed)
-        buffer = RolloutBuffer(self.obs_shape,
-                               getattr(self, "act_dim", getattr(self, "n_actions", 1)),
-                               cfg.rollout_steps, cfg.num_envs, self.device, self.mode)
-
-        start_time = time.time()
-        while self.global_step < cfg.total_timesteps:
-            for t in range(cfg.rollout_steps):
-                with torch.no_grad():
-                    x = self._obs_to_tensor(obs)
-                    if self.mode == "continuous":
-                        mean, std = self.net.dist_params(x)
-                        normal = torch.distributions.Normal(mean, std)
-                        u = normal.rsample()
-                        a_tanh = torch.tanh(u)
-                        log_prob_u = normal.log_prob(u).sum(-1)
-                        correction = torch.log(1 - a_tanh.pow(2) + 1e-6).sum(-1)
-                        logp = log_prob_u - correction
-                        actions_env = self._scale_action(a_tanh)
-                        v = self.net.value(x)
-                        buffer.actions[t] = a_tanh
-                    else:
-                        logits, v = self.net.forward(x)
-                        dist = torch.distributions.Categorical(logits=logits)
-                        a = dist.sample()
-                        logp = dist.log_prob(a)
-                        actions_env = a
-                        buffer.actions[t] = a
-
-                    buffer.obs[t] = x
-                    buffer.logprobs[t] = logp
-                    buffer.values[t] = v
-
-                # Step env
-                act = actions_env
-                if isinstance(act, torch.Tensor):
-                    act_np = act.cpu().numpy()
-                else:
-                    act_np = act
-                next_obs, reward, terminated, truncated, _ = self.env.step(act_np)
-                buffer.rewards[t] = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
-                buffer.terminated[t] = torch.as_tensor(terminated, dtype=torch.bool, device=self.device)
-                buffer.truncated[t] = torch.as_tensor(truncated, dtype=torch.bool, device=self.device)
-
-                self.episode_returns += reward
-                self.episode_lengths += 1
-                for i in range(cfg.num_envs):
-                    if terminated[i] or truncated[i]:
-                        self.completed_returns.append(self.episode_returns[i])
-                        self.completed_lengths.append(self.episode_lengths[i])
-                        self.episode_returns[i] = 0.0
-                        self.episode_lengths[i] = 0
-
-                obs = next_obs
-                self.global_step += cfg.num_envs
-                if self.global_step >= cfg.total_timesteps:
-                    break
+            # Normalize obs if enabled
+            flat_obs = next_obs.view(num_envs, -1)
+            if obs_norm is not None:
+                obs_norm.update(flat_obs)
+                flat_obs = obs_norm.normalize(flat_obs)
 
             with torch.no_grad():
-                x = self._obs_to_tensor(obs)
-                last_value = self.net.value(x)
+                # value from critic
+                v = ac.critic(flat_obs)
+                # action + logprob
+                if ac.is_continuous:
+                    a, logp = ac.act(flat_obs)
+                    env_a = action_postproc(a, ac)
+                    env_a_np = env_a.detach().cpu().numpy()
+                else:
+                    a, logp = ac.act(flat_obs)
+                    env_a_np = a.detach().cpu().numpy()
 
-            self._compute_gae(buffer, last_value)
-            self._update(buffer, epoch=self.global_step // (cfg.rollout_steps * cfg.num_envs))
+            # step
+            o2, r, terminated, truncated, infos = venv.step(env_a_np)
+            done = np.logical_or(terminated, truncated)
 
-            if self.completed_returns:
-                mean_r = float(np.mean(self.completed_returns[-10:]))
-                mean_l = float(np.mean(self.completed_lengths[-10:]))
+            # Reward scaling (pre-GAE)
+            if reward_scale != 1.0:
+                r = np.asarray(r, dtype=np.float32) * reward_scale
+
+            # log episodic info
+            ep_ret_env += torch.as_tensor(r, device=dev, dtype=torch.float32)
+            ep_len_env += torch.ones_like(ep_len_env)
+            for i in range(num_envs):
+                if done[i]:
+                    ep_returns.append(float(ep_ret_env[i].item()))
+                    ep_lengths.append(int(ep_len_env[i].item()))
+                    ep_ret_env[i] = 0.0
+                    ep_len_env[i] = 0.0
+
+            # store
+            storage.obs[t] = flat_obs
+            if ac.is_continuous:
+                storage.actions[t] = a
             else:
-                mean_r, mean_l = float("nan"), float("nan")
-            elapsed = time.time() - start_time
-            fps = int(self.global_step / elapsed) if elapsed > 0 else 0
-            print(f"step {self.global_step:>7} | ep_ret {mean_r:8.1f} | ep_len {mean_l:6.1f} | fps {fps}")
+                storage.actions[t] = a
+            storage.logprobs[t] = logp
+            storage.values[t] = v
+            storage.rewards[t] = torch.as_tensor(r, device=dev, dtype=torch.float32)
+            storage.dones[t] = next_done
 
-        return {
-            "steps": self.global_step,
-            "mean_return": float(np.mean(self.completed_returns[-100:])) if self.completed_returns else float("nan"),
-        }
+            # next
+            next_obs = torch.as_tensor(o2, dtype=torch.float32, device=dev)
+            next_done = torch.as_tensor(done, dtype=torch.float32, device=dev)
+
+        # print log line
+        elapsed = time.time() - start_time
+        fps = int(global_step / max(elapsed, 1e-6))
+        disp_ret = (np.mean(ep_returns[-10:]) if len(ep_returns) else float("nan"))
+        disp_len = (np.mean(ep_lengths[-10:]) if len(ep_lengths) else float("nan"))
+        print(f"step {global_step:8d} | ep_ret {disp_ret:8.1f} | ep_len {disp_len:6.1f} | fps {fps}")
+
+        # ===== Bootstrap value =====
+        with torch.no_grad():
+            flat_obs = next_obs.view(num_envs, -1)
+            if obs_norm is not None:
+                flat_obs = obs_norm.normalize(flat_obs)
+            next_value = ac.critic(flat_obs)
+
+        # ===== Compute GAE & returns =====
+        advantages = torch.zeros_like(storage.rewards, device=dev)
+        lastgaelam = torch.zeros(num_envs, device=dev)
+        for t in reversed(range(rollout_steps)):
+            nextnonterminal = 1.0 - storage.dones[t]
+            nextv = next_value if t == rollout_steps - 1 else storage.values[t + 1]
+            delta = storage.rewards[t] + gamma * nextv * nextnonterminal - storage.values[t]
+            lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
+            advantages[t] = lastgaelam
+        returns = advantages + storage.values
+
+        # flatten batch
+        b_obs = storage.obs.reshape(-1, storage.obs.shape[-1])
+        b_actions = storage.actions.reshape(-1, *storage.actions.shape[2:])
+        b_logprobs = storage.logprobs.reshape(-1)
+        b_advantages = advantages.reshape(-1)
+        b_returns = returns.reshape(-1)
+        b_values = storage.values.reshape(-1)
+
+        # Advantage norm over whole buffer
+        if adv_norm:
+            b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+
+        # ===== PPO Updates =====
+        batch_size = b_obs.shape[0]
+        idxs = np.arange(batch_size)
+
+        # LR Anneal
+        if lr_anneal == "linear":
+            frac = 1.0 - (global_step / float(total_timesteps))
+            for g in optimizer.param_groups:
+                g["lr"] = lr * frac
+
+        for epoch in range(n_epochs):
+            np.random.shuffle(idxs)
+            kl_exceeded = False
+            for start in range(0, batch_size, minibatch_size):
+                end = start + minibatch_size
+                mb_idx = idxs[start:end]
+                mb_obs = b_obs[mb_idx]
+                mb_actions = b_actions[mb_idx]
+                mb_oldlog = b_logprobs[mb_idx]
+                mb_adv = b_advantages[mb_idx]
+                mb_ret = b_returns[mb_idx]
+                mb_val = b_values[mb_idx]
+
+                # new logprob & value
+                if not ac.is_continuous:
+                    # discrete: actions are (N,)
+                    newlogprob, newvalue = ac.evaluate_actions(mb_obs, mb_actions)
+                else:
+                    # continuous: actions are (N, act_dim)
+                    newlogprob, newvalue = ac.evaluate_actions(mb_obs, mb_actions)
+
+                logratio = newlogprob - mb_oldlog
+                ratio = torch.exp(logratio)
+
+                # Policy loss (clipped surrogate)
+                pg_loss1 = -mb_adv * ratio
+                pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                # Value loss (with optional clipping)
+                if use_value_clip:
+                    v_clipped = mb_val + (newvalue - mb_val).clamp(-vf_clip_coef, vf_clip_coef)
+                    v_loss_unclipped = (newvalue - mb_ret).pow(2)
+                    v_loss_clipped = (v_clipped - mb_ret).pow(2)
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                else:
+                    v_loss = 0.5 * (newvalue - mb_ret).pow(2).mean()
+
+                # Entropy bonus
+                if ac.is_continuous:
+                    # approximate entropy from std (works fine)
+                    _, std = ac.actor(mb_obs)
+                    entropy = (0.5 * (1.0 + math.log(2 * math.pi)) + torch.log(std)).sum(-1).mean()
+                else:
+                    logits = ac.actor(mb_obs)
+                    dist = torch.distributions.Categorical(logits=logits)
+                    entropy = dist.entropy().mean()
+
+                loss = pg_loss + v_loss * vf_coef - ent_coef * entropy
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(ac.parameters(), max_grad_norm)
+                optimizer.step()
+
+                # Target KL early stop
+                with torch.no_grad():
+                    approx_kl = (ratio.log() - (ratio - 1)).mean().abs()
+                if approx_kl > target_kl:
+                    kl_exceeded = True
+                    break
+
+            if kl_exceeded:
+                break
+
+    # End training — summarize
+    mean_return = float(np.mean(ep_returns[-100:])) if len(ep_returns) else float("nan")
+    result = {"steps": global_step, "mean_return": mean_return}
+
+    # Save checkpoint
+    os.makedirs("checkpoints", exist_ok=True)
+    ckpt_path = os.path.join("checkpoints", "ppo_final.pt")
+    torch.save(
+        {
+            "model_state_dict": ac.state_dict(),
+            "cfg": cfg,
+            "obs_norm": {
+                "mean": (obs_norm.mean.detach().cpu() if obs_norm else None),
+                "var": (obs_norm.var.detach().cpu() if obs_norm else None),
+                "count": (obs_norm.count.detach().cpu() if obs_norm else None),
+            } if obs_norm else None,
+        },
+        ckpt_path,
+    )
+    print(f"Training finished: {result}")
+    print(f"Saved checkpoint to {ckpt_path}")
+    return result
