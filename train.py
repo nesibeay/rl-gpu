@@ -1,7 +1,8 @@
 # train.py — unified entrypoint for PPO (supports continuous + discrete)
+from torch.utils.tensorboard import SummaryWriter 
 import argparse, yaml, torch, numpy as np, random, dataclasses, os
 
-from rl.ppo.ppo import PPO, PPOConfig  # keeps your original import style
+from rl.ppo.ppo import PPO, PPOConfig  
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -30,6 +31,11 @@ def main():
 
     cfg = PPOConfig(**filtered)
 
+    #TSB-ADD, This creates a unique folder like 'runs/Pendulum-v1_16776..._ppo'
+    run_name = f"{cfg.env_id}_{int(time.time())}_{cfg.mode}"
+    writer = SummaryWriter(f"runs/{run_name}")
+    print(f"TensorBoard logs will be saved to: runs/{run_name}")
+
     # Honor float32 matmul precision if given (CUDA only)
     if cfg.float32_matmul_precision:
         try:
@@ -41,7 +47,11 @@ def main():
     set_seed(cfg.seed)
 
     agent = PPO(cfg)
-    stats = agent.train()
+    stats = agent.train(writer=writer) # Pass the writer object here TSB-ADD writerobj
+
+    # 4. CLOSE THE WRITER AT THE END
+    writer.close()
+    print("TensorBoard writer closed.")
 
     # Save checkpoint again in the format you had
     os.makedirs('checkpoints', exist_ok=True)

@@ -221,7 +221,7 @@ class PPO:
         self.n_actions = None
         self.mode = "ppo"
 
-    def train(self):
+    def train(self, writer: Optional[SummaryWriter] = None):
         cfg = self.cfg
         _set_tf32_guard(cfg)
         use_compile = bool(cfg.get("use_compile", False)) and torch.cuda.is_available()
@@ -345,6 +345,17 @@ class PPO:
             disp_len = (np.mean(ep_lengths[-10:]) if len(ep_lengths) else float("nan"))
             print(f"step {gstep:8d} | ep_ret {disp_ret:8.1f} | ep_len {disp_len:6.1f} | fps {fps}")
 
+
+            # 2. ADD THE TENSORBOARD LOGGING LOGIC HERE
+            if writer: # Only log if a writer was provided
+                writer.add_scalar("charts/episodic_return", disp_ret, gstep)
+                writer.add_scalar("charts/episodic_length", disp_len, gstep)
+                writer.add_scalar("charts/fps", fps, gstep)
+                # Also log the learning rate to visualize the annealing
+                if lr_anneal:
+                    writer.add_scalar("charts/learning_rate", opt.param_groups[0]["lr"], gstep)
+
+                    
             # ===== bootstrap & GAE =====
             with torch.no_grad():
                 flat_obs = next_obs.view(num_envs, -1)
