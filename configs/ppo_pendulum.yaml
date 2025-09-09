@@ -1,19 +1,34 @@
-# configs/ppo_pendulum.yaml
+# === Stable Pendulum preset ===
 env_id: Pendulum-v1
 seed: 1
-total_timesteps: 400000
-num_envs: 16
-rollout_steps: 128         # 2048 steps/update
-minibatch_size: 1024
+total_timesteps: 1200000          # give it runway; Pendulum likes more steps
+num_envs: 16                       # 64 on GPU if you have headroom
+rollout_steps: 256                 # 64 on GPU if num_envs is 64 (4096 steps/update)
 n_epochs: 10
-lr: 0.0003
-clip_coef: 0.2
-ent_coef: 0.0
+minibatch_size: 2048               # keep ~2-8 minibatches per update; 4096/batch -> 2 minibatches
 gamma: 0.99
 gae_lambda: 0.95
+clip_coef: 0.2
+vf_clip_coef: 0.2
+ent_coef: 0.01                     # encourage exploration early
 vf_coef: 0.5
 max_grad_norm: 0.5
-anneal_lr: true
-device: auto
-vector_env: sync
-use_compile: false
+
+actor_hidden_sizes: [64, 64]
+critic_hidden_sizes: [64, 64]
+activation: tanh
+
+lr: 3.0e-4
+lr_anneal: linear                  # linearly decay lr to 0 across training
+
+# — The two switches below are the “unlockers” —
+reward_scale: 0.1                  # NEW: scale rewards before GAE (Pendulum’s magnitudes are large)
+obs_norm: true                     # NEW: running mean/std normalizer on observations
+
+# — Keep your existing extras consistent —
+use_tanh_squash: true              # tanh-Gaussian with log-prob correction
+adv_norm: true
+target_kl: 0.015                   # stop early in an update if policy moves too fast
+use_value_clip: true
+use_compile: false                 # enable on GPU if compile warmup is okay
+float32_matmul_precision: high     # TF32/“high” is fine on NVIDIA
