@@ -1,16 +1,18 @@
-# === Stable Pendulum preset ===
+# --- PPO Pendulum (GPU 64x64) stable ---
 env_id: Pendulum-v1
 seed: 1
-total_timesteps: 1200000          # give it runway; Pendulum likes more steps
-num_envs: 64                       # 64 on GPU if you have headroom
-rollout_steps: 64                 # 64 on GPU if num_envs is 64 (4096 steps/update)
-n_epochs: 10
-minibatch_size: 2048               # keep ~2-8 minibatches per update; 4096/batch -> 2 minibatches
+total_timesteps: 1200000
+
+num_envs: 64
+rollout_steps: 64               # 4096 steps/update
+
+n_epochs: 4                     # ↓ fewer, gentler passes
+minibatch_size: 1024            # 4 minibatches per update
 gamma: 0.99
 gae_lambda: 0.95
 clip_coef: 0.2
 vf_clip_coef: 0.2
-ent_coef: 0.01                     # encourage exploration early
+ent_coef: 0.02                  # a bit more exploration for Pendulum
 vf_coef: 0.5
 max_grad_norm: 0.5
 
@@ -18,17 +20,17 @@ actor_hidden_sizes: [64, 64]
 critic_hidden_sizes: [64, 64]
 activation: tanh
 
-lr: 3.0e-4
-lr_anneal: linear                  # linearly decay lr to 0 across training
+lr: 2.0e-4                      # slightly lower when parallelism ↑
+lr_anneal: linear
 
-# — The two switches below are the “unlockers” —
-reward_scale: 0.1                  # NEW: scale rewards before GAE (Pendulum’s magnitudes are large)
-obs_norm: true                     # NEW: running mean/std normalizer on observations
-
-# — Keep your existing extras consistent —
-use_tanh_squash: true              # tanh-Gaussian with log-prob correction
+use_tanh_squash: true
 adv_norm: true
-target_kl: 0.015                   # stop early in an update if policy moves too fast
 use_value_clip: true
-use_compile: false                 # enable on GPU if compile warmup is okay
-float32_matmul_precision: high     # TF32/“high” is fine on NVIDIA
+target_kl: 0.015
+
+# NEW: the two “unlockers”
+reward_scale: 0.1               # scale rewards before GAE/returns
+obs_norm: true                  # running mean/std on observations
+
+use_compile: true               # OK on GPU
+float32_matmul_precision: high  # TF32 path on NVIDIA
