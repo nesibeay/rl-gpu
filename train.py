@@ -1,35 +1,64 @@
-# train.py  — unified entrypoint for discrete & continuous PPO
-import argparse, yaml, torch
-from rl.utils.envs import make_vec_env
-from rl.ppo.ppo import PPOConfig, PPOAgent
+# train.py — unified entrypoint for PPO (supports continuous + discrete)
+import argparse, yaml, torch, numpy as np, random, dataclasses
 
-def load_cfg(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        d = yaml.safe_load(f)
+from rl.ppo.ppo import PPO, PPOConfig
 
-    # ---- legacy → new field names (so your old configs still run) ----
-    if "update_epochs" in d and "n_epochs" not in d:
-        d["n_epochs"] = int(d.pop("update_epochs"))
-    if "learning_rate" in d and "lr" not in d:
-        d["lr"] = float(d.pop("learning_rate"))
-    # sensible defaults if missing (for old configs)
-    d.setdefault("vector_env", "sync")
-    d.setdefault("use_amp", False)
-    d.setdefault("use_compile", False)
-    return d
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/ppo_pendulum.yaml")
+    args = parser.parse_args()
+
+    with open(args.config, "r") as f:
+        cfg_dict = yaml.safe_load(f)
+
+    # Filter out unknown YAML keys so PPOConfig(**...) never crashes
+    valid_keys = {f.name for f in dataclasses.fields(PPOConfig)}
+    filtered = {k: v for k, v in cfg_dict.items() if k in valid_keys}
+    extras = {k: v for k, v in cfg_dict.items() if k not in valid_keys}
+    if extras:
+        print("[train] Ignoring extra config keys:", sorted(extras.keys()))
+
+    cfg = PPOConfig(**filtered)
+
+    # Optional: honor float32_matmul_precision from YAML (useful on NVIDIA GPUs)
+    prec = getattr(cfg, "float32_matmul_precision", None)
+    if prec:
+        try:
+            torch.set_float32_matmul_precision(str(prec))
+            print("Set torch.float32 matmul precision ->", prec)
+        except Exception as e:
+            print("Could not set float32 matmul precision:", e)
+
+    set_seed(cfg.seed)
+
+    agent = PPO(cfg)
+    stats = agent.train()
+
+    # Save checkpoint
+    import os
+    os.makedirs('checkpoints', exist_ok=True)
+    ckpt = {
+        'model_state_dict': agent.net.state_dict(),
+        'config': cfg.__dict__,
+        'env_id': cfg.env_id,
+        'mode': getattr(agent, 'mode', 'unknown'),
+        'obs_shape': agent.obs_shape,
+        'act_dim': getattr(agent, 'act_dim', None),
+        'n_actions': getattr(agent, 'n_actions', None),
+    }
+    torch.save(ckpt, 'checkpoints/ppo_final.pt')
+    print("Training finished:", stats)
+    print("Saved checkpoint to checkpoints/ppo_final.pt")
+
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", "--cfg", required=True, help="Path to YAML config")
-    args = ap.parse_args()
-
-    cfg_dict = load_cfg(args.config)
-    cfg = PPOConfig(**cfg_dict)
-
-    # (Optional) slightly faster matmul on CUDA
-    if cfg.device in ("auto", "cuda") and torch.cuda.is_available():
-        torch.set_float32_matmul_precision("high")
-
-    envs = make_vec_env(cfg.env_id, cfg.num_envs, cfg.seed, vector_type=cfg.vector_env)
-    agent = PPOAgent(envs, cfg)
-    agent.train()
+    main()

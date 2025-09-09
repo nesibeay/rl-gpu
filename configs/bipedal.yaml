@@ -1,0 +1,36 @@
+# PPO config for BipedalWalker-v3 (CONTINUOUS)
+# This task is harder; allocate more steps or scale up model if needed
+env_id: BipedalWalker-v3
+seed: 1
+
+# Training budget — may need 1M+ for strong results; start with 1M
+total_timesteps: 1000000
+
+# Vectorization + rollouts
+num_envs: 16
+rollout_steps: 256
+
+# Optimization
+n_epochs: 10
+minibatch_size: 2048
+lr: 0.0003
+clip_coef: 0.2
+
+# Advantage/returns
+gamma: 0.99
+gae_lambda: 0.95
+
+# Loss coefficients
+ent_coef: 0.0
+vf_coef: 0.5
+max_grad_norm: 0.5
+
+# Misc
+anneal_lr: true
+device: auto
+vector_env: sync
+use_amp: false
+use_compile: false
+
+# Model — can bump to [128,128] if you have GPU budget
+hidden_sizes: [64, 64]

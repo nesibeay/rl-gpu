@@ -1,207 +1,222 @@
-# rl/ppo/ppo_continuous.py
+"""
+# ppo_continuous.py (Refactored Version)
+
+import os
+import random
+import time
 from dataclasses import dataclass
-import math
+
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import gymnasium as gym
-from gymnasium.vector import SyncVectorEnv
+from torch.distributions.normal import Normal
+from torch.utils.tensorboard import SummaryWriter
 
+# Import your network from networks.py
+from networks import ActorCritic 
 
 @dataclass
 class PPOConfig:
-    env_id: str
-    seed: int
-    device: str
-    num_envs: int
-    total_timesteps: int
-    rollout_steps: int
-    gamma: float
-    gae_lambda: float
-    update_epochs: int
-    minibatch_size: int
-    clip_coef: float
-    vf_coef: float
-    ent_coef: float
-    learning_rate: float
-    net_hidden_sizes: list
+    """Class to hold all hyperparameters for PPO."""
+    # --- Experiment settings ---
+    exp_name: str = "PPO_Refactored"
+    seed: int = 1
+    torch_deterministic: bool = True
+    
+    # --- Environment settings ---
+    env_id: str = "BipedalWalker-v3"
+    total_timesteps: int = 2_000_000
+    
+    # --- Algorithm-specific settings ---
+    learning_rate: float = 3e-4
+    num_envs: int = 1 # In this baseline, we use 1 environment. Will be crucial for GPU parallelization.
+    num_steps: int = 2048 # Steps to run in each environment per policy rollout.
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    num_minibatches: int = 32
+    update_epochs: int = 10
+    clip_coef: float = 0.2
+    ent_coef: float = 0.0
+    vf_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    
+    # --- Runtime settings ---
+    device: str = "cpu" # This is what we will change to "cuda" for GPU training.
 
+class Agent:
+    """
+    The Agent class that holds the actor-critic network.
+    This is a wrapper around your ActorCritic class from networks.py.
+    """
+    def __init__(self, envs, device):
+        self.device = device
+        self.net = ActorCritic(envs).to(device)
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden_sizes):
-        super().__init__()
-        layers = []
-        last = obs_dim
-        for h in hidden_sizes:
-            layers += [nn.Linear(last, h), nn.Tanh()]
-            last = h
-        self.body = nn.Sequential(*layers)
-        self.mu = nn.Linear(last, act_dim)
-        self.log_std = nn.Parameter(torch.zeros(act_dim))
-        self.v = nn.Linear(last, 1)
+    def get_value(self, x):
+        # We need to convert numpy arrays to tensors before passing to the network
+        return self.net.get_value(torch.Tensor(x).to(self.device))
 
-    def forward(self, x):
-        h = self.body(x)
-        mu = self.mu(h)
-        v = self.v(h).squeeze(-1)
-        std = torch.exp(self.log_std)
-        return mu, std, v
+    def get_action_and_value(self, x, action=None):
+        # We need to convert numpy arrays to tensors before passing to the network
+        action, log_prob, entropy, value = self.net.get_action_and_value(torch.Tensor(x).to(self.device), action)
+        return action, log_prob, entropy, value
 
-    def act(self, x, action_scale):
-        mu, std, v = self.forward(x)
-        dist = torch.distributions.Normal(mu, std)
-        u = dist.rsample()  # reparameterized
-        logprob_u = dist.log_prob(u).sum(-1)
-        a = torch.tanh(u) * action_scale  # squash to [-1,1] then scale
-        return a, u, logprob_u, v
+def main():
+    # 1. Initialize configuration and environment
+    config = PPOConfig()
+    run_name = f"{config.env_id}__{config.exp_name}__{config.seed}__{int(time.time())}"
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(config).items()])),
+    )
 
-    def evaluate(self, x, u):
-        mu, std, v = self.forward(x)
-        dist = torch.distributions.Normal(mu, std)
-        logprob_u = dist.log_prob(u).sum(-1)
-        entropy = dist.entropy().sum(-1)
-        return logprob_u, entropy, v
+    # 2. Seeding for reproducibility
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    torch.backends.cudnn.deterministic = config.torch_deterministic
 
+    # 3. Setup device (CPU or GPU)
+    device = torch.device(config.device)
 
-def set_seed(seed):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    # 4. Environment setup
+    envs = gym.vector.SyncVectorEnv([lambda: gym.make(config.env_id) for _ in range(config.num_envs)])
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
+    # 5. Agent and Optimizer setup
+    agent = Agent(envs, device)
+    optimizer = optim.Adam(agent.net.parameters(), lr=config.learning_rate, eps=1e-5)
 
-def ppo_train_continuous(cfg: PPOConfig):
-    device = torch.device(cfg.device)
-    set_seed(cfg.seed)
+    # 6. Storage setup for rollouts
+    batch_size = int(config.num_envs * config.num_steps)
+    minibatch_size = int(batch_size // config.num_minibatches)
 
-    # Vectorized envs (Gymnasium 1.2.0: use SyncVectorEnv)
-    def make_env(seed_offset: int):
-        def _thunk():
-            env = gym.make(cfg.env_id)
-            env.reset(seed=cfg.seed + seed_offset)
-            return env
-        return _thunk
+    obs = torch.zeros((config.num_steps, config.num_envs) + envs.single_observation_space.shape).to(device)
+    actions = torch.zeros((config.num_steps, config.num_envs) + envs.single_action_space.shape).to(device)
+    logprobs = torch.zeros((config.num_steps, config.num_envs)).to(device)
+    rewards = torch.zeros((config.num_steps, config.num_envs)).to(device)
+    dones = torch.zeros((config.num_steps, config.num_envs)).to(device)
+    values = torch.zeros((config.num_steps, config.num_envs)).to(device)
 
-    envs = SyncVectorEnv([make_env(i) for i in range(cfg.num_envs)])
+    # 7. Main training loop
+    global_step = 0
+    start_time = time.time()
+    next_obs, _ = envs.reset(seed=config.seed)
+    next_obs = torch.Tensor(next_obs).to(device)
+    next_done = torch.zeros(config.num_envs).to(device)
+    num_updates = config.total_timesteps // batch_size
 
-    obs_space = envs.single_observation_space
-    act_space = envs.single_action_space
-    assert len(act_space.shape) == 1, "Assumes 1D continuous actions."
+    for update in range(1, num_updates + 1):
+        # Annealing the learning rate is a common practice, but we'll keep it simple for now.
+        
+        # --- DATA COLLECTION PHASE ---
+        for step in range(0, config.num_steps):
+            global_step += 1 * config.num_envs
+            obs[step] = next_obs
+            dones[step] = next_done
 
-    obs_dim = obs_space.shape[0]
-    act_dim = act_space.shape[0]
-    action_high = torch.as_tensor(act_space.high, dtype=torch.float32, device=device)
-    action_scale = action_high  # assumes symmetric [-high, high]
+            with torch.no_grad():
+                action, logprob, _, value = agent.net.get_action_and_value(next_obs)
+                values[step] = value.flatten()
+            actions[step] = action
+            logprobs[step] = logprob
 
-    policy = ActorCritic(obs_dim, act_dim, cfg.net_hidden_sizes).to(device)
-    optimizer = optim.Adam(policy.parameters(), lr=cfg.learning_rate)
-
-    T = cfg.rollout_steps
-    updates = math.ceil(cfg.total_timesteps / (T * cfg.num_envs))
-
-    # Buffers
-    obs_buf = torch.zeros((T, cfg.num_envs, obs_dim), device=device)
-    u_buf = torch.zeros((T, cfg.num_envs, act_dim), device=device)  # pre-tanh samples
-    logp_buf = torch.zeros((T, cfg.num_envs), device=device)
-    rew_buf = torch.zeros((T, cfg.num_envs), device=device)
-    done_buf = torch.zeros((T, cfg.num_envs), device=device)
-    val_buf = torch.zeros((T, cfg.num_envs), device=device)
-
-    # Reset and get first obs
-    obs_np, _ = envs.reset()
-    obs = torch.tensor(obs_np, dtype=torch.float32, device=device)
-
-    global_steps = 0
-
-    # Episode-return trackers (manual, cross-version safe)
-    ep_returns = np.zeros(cfg.num_envs, dtype=np.float32)
-    finished_returns = []
-
-    for update in range(1, updates + 1):
-        policy.eval()
-        with torch.no_grad():
-            for t in range(T):
-                obs_buf[t] = obs
-                a, u, logp_u, v = policy.act(obs, action_scale)
-                u_buf[t] = u
-                logp_buf[t] = logp_u
-                val_buf[t] = v
-
-                next_obs, reward, terminated, truncated, infos = envs.step(a.cpu().numpy())
-                done = np.logical_or(terminated, truncated)
-
-                rew_buf[t] = torch.tensor(reward, dtype=torch.float32, device=device)
-                done_buf[t] = torch.tensor(done, dtype=torch.float32, device=device)
-
-                # Track episodic returns manually
-                ep_returns += reward  # vector add per env
+            next_obs, reward, terminated, truncated, _ = envs.step(action.cpu().numpy())
+            done = np.logical_or(terminated, truncated)
+            rewards[step] = torch.tensor(reward).to(device).view(-1)
+            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
+            
+            # This is just for logging the episodic return
+            # It's okay for this part to be a bit verbose for now
+            if any(done):
+                # In a vectorized env, we need to find which env just finished
                 for i, d in enumerate(done):
                     if d:
-                        finished_returns.append(ep_returns[i])
-                        ep_returns[i] = 0.0
+                        # This part is a bit tricky, but it's for logging purposes only
+                        # It finds the episode info in the `_info` dict
+                        episode_return = envs.call('get_episode_rewards')[i]
+                        if episode_return:
+                            print(f"global_step={global_step}, episodic_return={episode_return[-1]}")
+                            writer.add_scalar("charts/episodic_return", episode_return[-1], global_step)
 
-                obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
-                global_steps += cfg.num_envs
 
-            # Bootstrap value for the last obs
-            _, _, next_v = policy.forward(obs)
+        # --- LEARNING PHASE ---
+        # This is where we call our new, separated learning logic
+        train(config, agent, optimizer, obs, actions, logprobs, rewards, dones, values, next_obs, next_done)
 
-        # ------- GAE -------
-        adv = torch.zeros_like(rew_buf, device=device)
-        lastgaelam = torch.zeros(cfg.num_envs, device=device)
-        for t in reversed(range(T)):
-            if t == T - 1:
-                nextnonterm = 1.0 - done_buf[t]
-                nextvalues = next_v
-            else:
-                nextnonterm = 1.0 - done_buf[t + 1]
-                nextvalues = val_buf[t + 1]
-            delta = rew_buf[t] + cfg.gamma * nextvalues * nextnonterm - val_buf[t]
-            lastgaelam = delta + cfg.gamma * cfg.gae_lambda * nextnonterm * lastgaelam
-            adv[t] = lastgaelam
-        ret = adv + val_buf
-
-        # Flatten
-        b_obs = obs_buf.reshape(-1, obs_dim)
-        b_u = u_buf.reshape(-1, act_dim)
-        b_logp = logp_buf.reshape(-1)
-        b_adv = adv.reshape(-1)
-        b_ret = ret.reshape(-1)
-
-        # Advantage norm
-        b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
-
-        # ------- PPO update -------
-        policy.train()
-        batch_size = b_obs.shape[0]
-        idxs = np.arange(batch_size)
-        for _ in range(cfg.update_epochs):
-            np.random.shuffle(idxs)
-            for start in range(0, batch_size, cfg.minibatch_size):
-                mb = idxs[start:start + cfg.minibatch_size]
-                mb_obs = b_obs[mb]
-                mb_u = b_u[mb]
-                old_logp = b_logp[mb]
-                mb_adv = b_adv[mb]
-                mb_ret = b_ret[mb]
-
-                new_logp, entropy, v = policy.evaluate(mb_obs, mb_u)
-                ratio = torch.exp(new_logp - old_logp)
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - cfg.clip_coef, 1.0 + cfg.clip_coef) * mb_adv
-                policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = 0.5 * (mb_ret - v).pow(2).mean()
-                entropy_bonus = entropy.mean()
-
-                loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy_bonus
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
-                optimizer.step()
-
-        if update == 1 or update % 10 == 0:
-            tr = float(np.mean(finished_returns[-10:])) if finished_returns else float("nan")
-            print(f"Update {update:4d}/{updates} | Steps {global_steps:7d} | "
-                  f"TrainReturn(last10) {tr:7.2f}")
+        # Log performance metrics
+        sps = int(global_step / (time.time() - start_time))
+        print(f"Steps per second: {sps}")
+        writer.add_scalar("charts/SPS", sps, global_step)
 
     envs.close()
-    print("Training done.")
+    writer.close()
+
+def train(config, agent, optimizer, obs, actions, logprobs, rewards, dones, values, next_obs, next_done):
+    """This function contains the learning logic separated from the main loop."""
+    # 1. Calculate advantages using GAE
+    with torch.no_grad():
+        next_value = agent.net.get_value(next_obs).reshape(1, -1)
+        advantages = torch.zeros_like(rewards).to(config.device)
+        lastgaelam = 0
+        for t in reversed(range(config.num_steps)):
+            if t == config.num_steps - 1:
+                nextnonterminal = 1.0 - next_done
+                nextvalues = next_value
+            else:
+                nextnonterminal = 1.0 - dones[t + 1]
+                nextvalues = values[t + 1]
+            delta = rewards[t] + config.gamma * nextvalues * nextnonterminal - values[t]
+            advantages[t] = lastgaelam = delta + config.gamma * config.gae_lambda * nextnonterminal * lastgaelam
+        returns = advantages + values
+
+    # 2. Flatten the batch for training
+    b_obs = obs.reshape((-1,) + obs.shape[2:])
+    b_logprobs = logprobs.reshape(-1)
+    b_actions = actions.reshape((-1,) + actions.shape[2:])
+    b_advantages = advantages.reshape(-1)
+    b_returns = returns.reshape(-1)
+    b_values = values.reshape(-1)
+
+    # 3. Optimizing the policy and value network
+    b_inds = np.arange(len(b_obs))
+    for epoch in range(config.update_epochs):
+        np.random.shuffle(b_inds)
+        for start in range(0, len(b_obs), config.num_minibatches):
+            end = start + config.num_minibatches
+            mb_inds = b_inds[start:end]
+
+            _, newlogprob, entropy, newvalue = agent.net.get_action_and_value(
+                b_obs[mb_inds], b_actions[mb_inds]
+            )
+            logratio = newlogprob - b_logprobs[mb_inds]
+            ratio = logratio.exp()
+
+            mb_advantages = b_advantages[mb_inds]
+            
+            # Policy loss
+            pg_loss1 = -mb_advantages * ratio
+            pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - config.clip_coef, 1 + config.clip_coef)
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+            # Value loss
+            newvalue = newvalue.view(-1)
+            v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+
+            # Entropy loss
+            entropy_loss = entropy.mean()
+            
+            # Total loss
+            loss = pg_loss - config.ent_coef * entropy_loss + v_loss * config.vf_coef
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(agent.net.parameters(), config.max_grad_norm)
+            optimizer.step()
+
+if __name__ == "__main__":
+    main()
+"""
