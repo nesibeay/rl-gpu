@@ -1,21 +1,20 @@
+# configs/ppo_pendulum_gpu.yaml
 env_id: Pendulum-v1
 seed: 1
-total_timesteps: 300000
-num_envs: 64
-rollout_steps: 512
+total_timesteps: 600000
+num_envs: 32
+rollout_steps: 256         # 8192 steps/update
+minibatch_size: 2048
 n_epochs: 10
-minibatch_size: 4096
-gamma: 0.99
-gae_lambda: 0.95
+lr: 0.0003
 clip_coef: 0.2
 ent_coef: 0.0
+gamma: 0.99
+gae_lambda: 0.95
 vf_coef: 0.5
 max_grad_norm: 0.5
-lr: 0.0003
 anneal_lr: true
-
 device: auto
 vector_env: sync
-use_amp: true
 use_compile: max-autotune
 float32_matmul_precision: high

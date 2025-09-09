@@ -1,21 +1,19 @@
-# PPO config for continuous/discrete control (works for Pendulum-v1)
+# configs/ppo_pendulum.yaml
 env_id: Pendulum-v1
 seed: 1
-total_timesteps: 300000
+total_timesteps: 400000
 num_envs: 16
-rollout_steps: 256
+rollout_steps: 128         # 2048 steps/update
+minibatch_size: 1024
 n_epochs: 10
-minibatch_size: 2048
-gamma: 0.99
-gae_lambda: 0.95
+lr: 0.0003
 clip_coef: 0.2
 ent_coef: 0.0
+gamma: 0.99
+gae_lambda: 0.95
 vf_coef: 0.5
 max_grad_norm: 0.5
-lr: 0.0003
 anneal_lr: true
-device: auto # auto|cpu|cuda|mps
-vector_env: sync # sync|async
-use_amp: false
+device: auto
+vector_env: sync
 use_compile: false
-hidden_sizes: [64, 64]
