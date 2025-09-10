@@ -1,0 +1,31 @@
+# === BipedalWalker-v3 Preset (GPU) ===
+env_id: BipedalWalker-v3
+seed: 1
+total_timesteps: 2000000 # BipedalWalker needs more time to learn
+
+
+# --- Use the same robust settings from Pendulum ---
+num_envs: 32
+rollout_steps: 256
+n_epochs: 20
+minibatch_size: 2048
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+vf_clip_coef: 0.2
+ent_coef: 0.001
+vf_coef: 0.5
+max_grad_norm: 1.0
+actor_hidden_sizes: [128, 128]
+critic_hidden_sizes: [128, 128]
+activation: tanh
+lr: 0.001
+lr_anneal: linear
+reward_scale: 0.1
+obs_norm: true
+use_value_clip: true
+adv_norm: true
+use_tanh_squash: true
+target_kl: 0.02
+use_compile: true
+float32_matmul_precision: high

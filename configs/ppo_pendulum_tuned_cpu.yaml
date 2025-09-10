@@ -1,0 +1,35 @@
+# === Expert-Tuned Pendulum Preset (CPU Version) ===
+env_id: Pendulum-v1
+seed: 1
+total_timesteps: 500000
+
+# --- CPU-SPECIFIC ADJUSTMENTS ---
+num_envs: 16          # Reduced parallelism for CPU
+use_compile: false    # torch.compile is not beneficial on CPU
+
+# --- LEARNING PARAMETERS (Identical to GPU version for fair comparison) ---
+rollout_steps: 256
+n_epochs: 20
+minibatch_size: 2048
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+vf_clip_coef: 0.2
+ent_coef: 0.001
+vf_coef: 0.5
+max_grad_norm: 1.0
+
+actor_hidden_sizes: [128, 128]
+critic_hidden_sizes: [128, 128]
+activation: tanh
+
+lr: 0.001
+lr_anneal: linear
+
+# --- STABILIZERS (Identical to GPU version) ---
+reward_scale: 0.1
+obs_norm: true
+use_value_clip: true
+adv_norm: true
+use_tanh_squash: true
+target_kl: 0.02

@@ -1,0 +1,30 @@
+# === CartPole-v1 Preset (CPU) ===
+env_id: CartPole-v1
+seed: 1
+total_timesteps: 100000 # CartPole is very fast to solve
+
+# --- Standard settings are fine for this simple env ---
+num_envs: 16
+rollout_steps: 128
+n_epochs: 10
+minibatch_size: 512
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+vf_clip_coef: 0.2
+ent_coef: 0.01 # A bit more entropy helps in discrete envs
+vf_coef: 0.5
+max_grad_norm: 0.5
+actor_hidden_sizes: [64, 64]
+critic_hidden_sizes: [64, 64]
+activation: tanh
+lr: 0.0003
+lr_anneal: linear
+obs_norm: false # Not needed for CartPole
+reward_scale: 1.0 # Not needed for CartPole
+use_value_clip: true
+adv_norm: true
+use_tanh_squash: false # Does not apply to discrete actions
+target_kl: 0.015
+use_compile: false
+float32_matmul_precision: high
