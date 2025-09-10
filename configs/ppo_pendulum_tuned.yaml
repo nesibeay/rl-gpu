@@ -1,0 +1,34 @@
+# === Expert-Tuned Pendulum Preset ===
+env_id: Pendulum-v1
+seed: 1
+total_timesteps: 500000        # Give it enough time to fully converge
+num_envs: 32                     # Good parallelism for a standard GPU
+rollout_steps: 256
+n_epochs: 20                     # Crucial for Pendulum: more learning epochs
+minibatch_size: 2048
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+vf_clip_coef: 0.2
+ent_coef: 0.001                  # Small amount of entropy is key
+vf_coef: 0.5
+max_grad_norm: 1.0
+
+actor_hidden_sizes: [128, 128]   # A slightly larger network
+critic_hidden_sizes: [128, 128]
+activation: tanh
+
+lr: 0.001                        # Pendulum often responds well to a slightly higher LR
+lr_anneal: linear
+
+# --- Critical Stabilizers ---
+reward_scale: 0.1
+obs_norm: true
+use_value_clip: true
+adv_norm: true
+use_tanh_squash: true
+target_kl: 0.02
+
+# --- Performance ---
+use_compile: true
+float32_matmul_precision: high
