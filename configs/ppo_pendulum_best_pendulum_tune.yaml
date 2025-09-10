@@ -1,0 +1,32 @@
+env_id: Pendulum-v1
+seed: 1
+total_timesteps: 300000
+num_envs: 16
+rollout_steps: 768
+n_epochs: 18
+minibatch_size: 4096
+gamma: 0.9811316981707556
+gae_lambda: 0.9750593213342496
+clip_coef: 0.11040497372413849
+vf_clip_coef: 0.2
+ent_coef: 0.0017908018669851589
+vf_coef: 0.31201293254461926
+max_grad_norm: 1.4835793359328726
+actor_hidden_sizes:
+- 64
+- 64
+critic_hidden_sizes:
+- 64
+- 64
+activation: tanh
+lr: 0.0031173155583896165
+lr_anneal: linear
+reward_scale: 0.1
+obs_norm: true
+use_tanh_squash: true
+adv_norm: true
+target_kl: 0.03734407784585723
+use_value_clip: true
+use_compile: false
+float32_matmul_precision: high
+init_log_std: -0.3063337965289385

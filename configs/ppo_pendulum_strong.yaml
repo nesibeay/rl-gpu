@@ -1,0 +1,37 @@
+# PPO config tuned for Pendulum-v1 (continuous)
+env_id: Pendulum-v1
+seed: 1
+
+# sample efficiency & stability
+total_timesteps: 300000
+num_envs: 16
+rollout_steps: 1024        # ↑ longer rollouts → stabler GAE/advantage
+n_epochs: 20               # a bit more optimization per batch
+minibatch_size: 4096       # larger minibatches → smoother updates
+
+# core PPO
+lr: 3.0e-4
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+vf_coef: 0.5
+ent_coef: 0.005            # small but nonzero; keeps some exploration
+max_grad_norm: 1.0
+target_kl: 0.02
+lr_anneal: "linear"        # decay LR over time (helps late training)
+
+# nets
+actor_hidden_sizes: [64, 64]
+critic_hidden_sizes: [64, 64]
+activation: tanh
+init_log_std: -1.0         # ↓ less initial action noise, speeds control learning
+
+# stabilizers
+adv_norm: true
+use_value_clip: true
+obs_norm: true             # ★ normalize observations (big win on Pendulum)
+reward_scale: 1.0          # keep returns interpretable; can try 0.5 if loss explodes
+
+# perf
+use_compile: false         # enable if compile works well on your box
+float32_matmul_precision: "high"

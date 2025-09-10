@@ -1,19 +1,16 @@
 # rl/ppo/ppo.py
-import math
-import os
-import time
+import math, os, time
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
-from torch.utils.tensorboard import SummaryWriter
-
 import numpy as np
 import torch
 import torch.nn as nn
 import gymnasium as gym
 from gymnasium.spaces import Box, Discrete
+from torch.utils.tensorboard import SummaryWriter
 
 # ----------------------------
-# Config (expands train.py whitelist)
+# Config
 # ----------------------------
 @dataclass
 class PPOConfig:
@@ -22,9 +19,9 @@ class PPOConfig:
     seed: int = 1
     total_timesteps: int = 300_000
     device: Optional[str] = None
-    mode: str = "ppo" 
+    mode: str = "ppo"
 
-    # vec env params
+    # vec env
     num_envs: int = 16
     rollout_steps: int = 256
 
@@ -41,7 +38,7 @@ class PPOConfig:
     n_epochs: int = 10
     minibatch_size: int = 2048
     target_kl: float = 0.015
-    lr_anneal: str = ""                  # "", "linear"
+    lr_anneal: str = ""  # "", "linear"
 
     # nets
     actor_hidden_sizes: tuple = (64, 64)
@@ -52,29 +49,35 @@ class PPOConfig:
     # stabilizers/toggles
     adv_norm: bool = True
     use_value_clip: bool = True
-    use_tanh_squash: bool = True         # reserved (continuous uses tanh)
-    reward_scale: float = 1.0            # <— NEW
-    obs_norm: bool = False               # <— NEW
+    use_tanh_squash: bool = True
+    reward_scale: float = 1.0
+    obs_norm: bool = False
 
     # perf
     use_compile: bool = False
-    float32_matmul_precision: Optional[str] = None  # e.g., "high" for TF32
+    float32_matmul_precision: Optional[str] = None  # e.g. "high" for TF32
 
-    # (future-proof) allow arbitrary extra keys without crashing
-    extra: dict = field(default_factory=dict)
+    extra: dict = field(default_factory=dict)  # ignore unknown YAML keys in train.py
 
     def to_dict(self) -> Dict[str, Any]:
         d = {k: getattr(self, k) for k in self.__dataclass_fields__.keys()}
-        # flatten basic fields (ignore helper)
         d.pop("extra", None)
         return d
 
 # ----------------------------
 # Utilities
 # ----------------------------
+def select_device(name: Optional[str] = None) -> torch.device:
+    """Small helper so eval can import this."""
+    if not name or name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if name == "cuda":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
 def _device_of(cfg: Dict[str, Any]) -> torch.device:
     dev = cfg.get("device", None)
-    return torch.device(dev) if dev else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(dev) if dev else select_device("auto")
 
 def _set_tf32_guard(cfg: Dict[str, Any]):
     if torch.cuda.is_available() and cfg.get("float32_matmul_precision", "") == "high":
@@ -118,9 +121,6 @@ class RunningNorm:
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) / (self.var.sqrt() + 1e-8)
 
-# ----------------------------
-# Models
-# ----------------------------
 def _mlp(sizes, activation="tanh"):
     acts = {"tanh": nn.Tanh, "relu": nn.ReLU, "elu": nn.ELU, "gelu": nn.GELU}
     layers = []
@@ -211,7 +211,7 @@ class ActorCritic(nn.Module):
         return low + (0.5 * (a + 1.0)) * (high - low)
 
 # ----------------------------
-# Trainer (class API expected by train.py)
+# Trainer
 # ----------------------------
 class PPO:
     def __init__(self, cfg: PPOConfig):
@@ -228,7 +228,6 @@ class PPO:
         _set_tf32_guard(cfg)
         use_compile = bool(cfg.get("use_compile", False)) and torch.cuda.is_available()
 
-        # Env
         env_id = cfg.get("env_id", "Pendulum-v1")
         seed = int(cfg.get("seed", 1))
         num_envs = int(cfg.get("num_envs", 16))
@@ -243,17 +242,14 @@ class PPO:
         elif isinstance(act_space, Discrete):
             self.n_actions = act_space.n
 
-        # Model
         ac = ActorCritic(obs_space, act_space, cfg).to(self.device)
         ac.actor = _maybe_compile(ac.actor, use_compile)
         ac.critic = _maybe_compile(ac.critic, use_compile)
-        self.net = ac  # for checkpointing in train.py
+        self.net = ac
 
-        # Optimizer
         lr = float(cfg.get("lr", 3e-4))
         opt = torch.optim.AdamW(ac.parameters(), lr=lr)
 
-        # PPO knobs
         gamma = float(cfg.get("gamma", 0.99))
         lam = float(cfg.get("gae_lambda", 0.95))
         clip_coef = float(cfg.get("clip_coef", 0.2))
@@ -281,29 +277,24 @@ class PPO:
         act_buf = torch.zeros((rollout_steps, num_envs) + act_shape, dtype=act_dtype, device=self.device)
         logp_buf = torch.zeros((rollout_steps, num_envs), dtype=torch.float32, device=self.device)
         rew_buf = torch.zeros((rollout_steps, num_envs), dtype=torch.float32, device=self.device)
-        done_buf = torch.zeros((rollout_steps, num_envs), dtype=torch.float32, device=self.device)
+        term_buf = torch.zeros((rollout_steps, num_envs), dtype=torch.float32, device=self.device)  # ONLY terminated
         val_buf = torch.zeros((rollout_steps, num_envs), dtype=torch.float32, device=self.device)
 
         obs_norm = RunningNorm(self.obs_shape, device=self.device) if use_obs_norm else None
 
-        # Reset
         next_obs, _ = venv.reset(seed=seed)
         next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
-        next_done = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
 
-        # Track episodic returns/lengths (scaled + raw)
-        ep_returns = []        # scaled by reward_scale
-        raw_ep_returns = []    # raw Gym rewards
-        ep_lengths = []
-        ep_ret_env = torch.zeros(num_envs, dtype=torch.float32, device=dev)
-        raw_ep_ret_env = torch.zeros(num_envs, dtype=torch.float32, device=dev)
-        ep_len_env = torch.zeros(num_envs, dtype=torch.float32, device=dev)
+        ep_returns, raw_ep_returns, ep_lengths = [], [], []
+        ep_ret_env = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
+        raw_ep_ret_env = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
+        ep_len_env = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
 
         start = time.time()
         gstep = 0
 
         while gstep < total_timesteps:
-            # ===== collect =====
+            # ========== collect ==========
             for t in range(rollout_steps):
                 gstep += num_envs
                 flat_obs = next_obs.view(num_envs, -1)
@@ -321,59 +312,48 @@ class PPO:
                         env_a = a.cpu().numpy()
 
                 o2, r, terminated, truncated, _ = venv.step(env_a)
-                done = np.logical_or(terminated, truncated)
+                done_any = np.logical_or(terminated, truncated)  # for episodic accounting only
 
-                # Dual streams
                 raw_r = np.asarray(r, dtype=np.float32)
                 scaled_r = raw_r * reward_scale if reward_scale != 1.0 else raw_r
 
-
-                ep_ret_env     += torch.as_tensor(scaled_r, device=self.device, dtype=torch.float32)
-                raw_ep_ret_env += torch.as_tensor(raw_r,    device=self.device, dtype=torch.float32)
-                ep_len_env     += 1
+                ep_ret_env += torch.as_tensor(scaled_r, device=self.device, dtype=torch.float32)
+                raw_ep_ret_env += torch.as_tensor(raw_r, device=self.device, dtype=torch.float32)
+                ep_len_env += 1
                 for i in range(num_envs):
-                    if done[i]:
-                        ep_returns.append(float(ep_ret_env[i].item()))         # scaled
-                        raw_ep_returns.append(float(raw_ep_ret_env[i].item())) # raw
+                    if done_any[i]:
+                        ep_returns.append(float(ep_ret_env[i].item()))
+                        raw_ep_returns.append(float(raw_ep_ret_env[i].item()))
                         ep_lengths.append(int(ep_len_env[i].item()))
                         ep_ret_env[i] = 0.0
                         raw_ep_ret_env[i] = 0.0
                         ep_len_env[i] = 0.0
-
 
                 obs_buf[t] = flat_obs
                 act_buf[t] = a
                 logp_buf[t] = logp
                 val_buf[t] = v
                 rew_buf[t] = torch.as_tensor(scaled_r, device=self.device, dtype=torch.float32)
-                done_buf[t] = torch.as_tensor(done, dtype=torch.float32,device=self.device)
-
+                term_buf[t] = torch.as_tensor(terminated, dtype=torch.float32, device=self.device)  # <— key change
 
                 next_obs = torch.as_tensor(o2, dtype=torch.float32, device=self.device)
-                next_done = torch.as_tensor(done, dtype=torch.float32, device=self.device)
 
-            # log
+            # logs
             fps = int(gstep / max(time.time() - start, 1e-6))
-            disp_ret =  (np.mean(ep_returns[-10:])     if ep_returns     else float("nan"))
-            disp_raw =  (np.mean(raw_ep_returns[-10:]) if raw_ep_returns else float("nan"))
-            disp_len =  (np.mean(ep_lengths[-10:])     if ep_lengths     else float("nan"))
-            print(
-                f"step {gstep:8d} | ep_ret {disp_ret:7.1f} (raw {disp_raw:7.1f}) "
-                f"| ep_len {disp_len:6.1f} | fps {fps}"
-            )
+            disp_ret = np.mean(ep_returns[-10:]) if ep_returns else float("nan")
+            disp_raw = np.mean(raw_ep_returns[-10:]) if raw_ep_returns else float("nan")
+            disp_len = np.mean(ep_lengths[-10:]) if ep_lengths else float("nan")
+            print(f"step {gstep:8d} | ep_ret {disp_ret:7.1f} (raw {disp_raw:7.1f}) | ep_len {disp_len:6.1f} | fps {fps}")
 
-
-            # 2. ADD THE TENSORBOARD LOGGING LOGIC HERE
-            if writer: # Only log if a writer was provided
+            if writer:
                 writer.add_scalar("charts/episodic_return", disp_ret, gstep)
+                writer.add_scalar("charts/episodic_return_raw", disp_raw, gstep)
                 writer.add_scalar("charts/episodic_length", disp_len, gstep)
                 writer.add_scalar("charts/fps", fps, gstep)
-                # Also log the learning rate to visualize the annealing
                 if lr_anneal:
                     writer.add_scalar("charts/learning_rate", opt.param_groups[0]["lr"], gstep)
 
-
-            # ===== bootstrap & GAE =====
+            # ========== GAE/bootstrap (use ONLY terminated to cut bootstrapping) ==========
             with torch.no_grad():
                 flat_obs = next_obs.view(num_envs, -1)
                 if obs_norm is not None:
@@ -383,7 +363,7 @@ class PPO:
             adv = torch.zeros_like(rew_buf, device=self.device)
             lastgaelam = torch.zeros(num_envs, device=self.device)
             for t in reversed(range(rollout_steps)):
-                nextnonterm = 1.0 - done_buf[t]
+                nextnonterm = 1.0 - term_buf[t]
                 nv = next_v if t == rollout_steps - 1 else val_buf[t + 1]
                 delta = rew_buf[t] + gamma * nv * nextnonterm - val_buf[t]
                 lastgaelam = delta + gamma * lam * nextnonterm * lastgaelam
@@ -401,13 +381,12 @@ class PPO:
             if adv_norm:
                 b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
 
-            # LR anneal
             if lr_anneal == "linear":
                 frac = 1.0 - (gstep / float(total_timesteps))
                 for g in opt.param_groups:
                     g["lr"] = lr * frac
 
-            # ===== updates =====
+            # updates
             idx = np.arange(b_obs.shape[0])
             for _ in range(n_epochs):
                 np.random.shuffle(idx)
@@ -448,13 +427,21 @@ class PPO:
                     loss = pg_loss + v_loss * vf_coef - ent_coef * entropy
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
-                    nn.utils.clip_grad_norm_(ac.parameters(), max_grad_norm)
+                    grad_norm = nn.utils.clip_grad_norm_(ac.parameters(), max_grad_norm)
                     opt.step()
 
                     with torch.no_grad():
-                        # approx_kl = E[logpi_new - logpi_old] ≈ (log_ratio - (ratio-1))
                         logratio = newlog - mb_old
                         approx_kl = (logratio.exp() - 1 - logratio).mean().abs()
+
+                    if writer:
+                        writer.add_scalar("loss/policy", pg_loss.item(), gstep)
+                        writer.add_scalar("loss/value", v_loss.item(), gstep)
+                        writer.add_scalar("loss/entropy", entropy.item(), gstep)
+                        writer.add_scalar("loss/total", loss.item(), gstep)
+                        writer.add_scalar("debug/approx_kl", approx_kl.item(), gstep)
+                        writer.add_scalar("debug/grad_norm", float(grad_norm), gstep)
+
                     if approx_kl > target_kl:
                         stop = True
                         break
@@ -462,28 +449,16 @@ class PPO:
                     break
 
         mean_return = float(np.mean(ep_returns[-100:])) if ep_returns else float("nan")
+        mean_return_raw = float(np.mean(raw_ep_returns[-100:])) if raw_ep_returns else float("nan")
 
-        # checkpoint (also done by train.py, but fine to save here too)
         os.makedirs("checkpoints", exist_ok=True)
         torch.save(
-            {
-                "model_state_dict": ac.state_dict(),
-                "cfg": cfg,
-                "obs_norm": {
-                    "mean": (obs_norm.mean.detach().cpu() if obs_norm else None),
-                    "var": (obs_norm.var.detach().cpu() if obs_norm else None),
-                    "count": (obs_norm.count.detach().cpu() if obs_norm else None),
-                } if obs_norm else None,
-            },
+            {"model_state_dict": ac.state_dict(), "config": cfg, "obs_shape": self.obs_shape},
             "checkpoints/ppo_final.pt",
         )
-        print(f"Training finished: {{'steps': {gstep}, 'mean_return': {mean_return}}}")
-        print("Saved checkpoint to checkpoints/ppo_final.pt")
-        return {"steps": gstep, "mean_return": mean_return}
+        print(f"Training finished: {{'steps': {gstep}, 'mean_return': {mean_return}, 'mean_return_raw': {mean_return_raw}}}")
+        return {"steps": gstep, "mean_return": mean_return, "mean_return_raw": mean_return_raw}
 
-# ----------------------------
-# Helpers
-# ----------------------------
 def _make_env(env_id: str, seed: int, idx: int):
     def thunk():
         env = gym.make(env_id)

@@ -1,13 +1,6 @@
-# eval.py — deterministic evaluation using saved checkpoint (continuous + discrete)
+# eval.py — deterministic evaluation using saved checkpoint
 import argparse, torch, numpy as np, gymnasium as gym
-from gymnasium.spaces import Box, Discrete
-from rl.ppo.ppo import select_device
-from rl.policy.networks import ActorCriticContinuous, ActorCriticDiscrete
-
-
-def scale_action(a_tanh, low, high):
-    return low + (a_tanh + 1.0) * 0.5 * (high - low)
-
+from rl.ppo.ppo import select_device, ActorCritic
 
 def main():
     parser = argparse.ArgumentParser()
@@ -23,26 +16,15 @@ def main():
     obs_space, act_space = env.observation_space, env.action_space
     assert len(obs_space.shape) == 1, "This eval script assumes vector observations."
 
-    obs_dim = int(np.prod(obs_space.shape))
-
     ckpt = torch.load(args.checkpoint, map_location=device)
-    hidden = tuple(ckpt.get('config', {}).get('hidden_sizes', (64, 64)))
+    cfg = ckpt.get("config", {})  # contains actor_hidden_sizes / critic_hidden_sizes, etc.
 
-    if isinstance(act_space, Box):
-        act_dim = int(np.prod(act_space.shape))
-        net = ActorCriticContinuous(obs_dim, act_dim, hidden=hidden).to(device)
-    elif isinstance(act_space, Discrete):
-        n_actions = int(act_space.n)
-        net = ActorCriticDiscrete(obs_dim, n_actions, hidden=hidden).to(device)
-    else:
-        raise ValueError("Unsupported action space for eval.")
-
-    net.load_state_dict(ckpt['model_state_dict'])
+    # Build the same network class used during training
+    net = ActorCritic(obs_space, act_space, cfg).to(device)
+    net.load_state_dict(ckpt["model_state_dict"])
     net.eval()
 
-    low = torch.as_tensor(getattr(act_space, 'low', None), dtype=torch.float32, device=device) if isinstance(act_space, Box) else None
-    high = torch.as_tensor(getattr(act_space, 'high', None), dtype=torch.float32, device=device) if isinstance(act_space, Box) else None
-
+    # Helpers
     def obs_to_tensor(o):
         x = torch.as_tensor(o, dtype=torch.float32, device=device)
         if x.dim() == 1:
@@ -58,13 +40,13 @@ def main():
         while not done:
             with torch.no_grad():
                 x = obs_to_tensor(obs)
-                if isinstance(act_space, Box):
-                    mean, _ = net.dist_params(x)
-                    a_tanh = torch.tanh(mean)
-                    a_env = scale_action(a_tanh, low, high)
+                if net.is_cont:
+                    mean, _ = net.actor(x)
+                    a_tanh = torch.tanh(mean)            # deterministic: use mean -> tanh
+                    a_env = net.scale_action(a_tanh)
                     act = a_env.squeeze(0).cpu().numpy()
                 else:
-                    logits, _ = net.forward(x)
+                    logits = net.actor(x)
                     act = torch.argmax(logits, dim=-1).squeeze(0).cpu().numpy()
             obs, reward, terminated, truncated, _ = env.step(act)
             done = bool(terminated or truncated)
@@ -74,7 +56,6 @@ def main():
         print(f"Episode {ep+1}: return={ret:.2f}, steps={steps}")
 
     print(f"Average return over {args.episodes} episodes: {np.mean(returns):.2f} +/- {np.std(returns):.2f}")
-
 
 if __name__ == "__main__":
     main()
