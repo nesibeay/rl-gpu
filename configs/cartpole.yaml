@@ -1,3 +1,4 @@
+'''
 env_id: CartPole-v1
 seed: 1
 
@@ -25,3 +26,4 @@ vector_env: sync     # try async; if your Windows CPU behaves oddly, switch to s
 use_amp: false        # you’re on CPU; keep false (true on CUDA)
 use_compile: false
 total_timesteps: 500000
+'''

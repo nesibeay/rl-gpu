@@ -1,3 +1,4 @@
+'''
 # === Stable Pendulum preset ===
 env_id: Pendulum-v1
 seed: 1
@@ -32,3 +33,4 @@ target_kl: 0.015                   # stop early in an update if policy moves too
 use_value_clip: true
 use_compile: false                 # enable on GPU if compile warmup is okay
 float32_matmul_precision: high     # TF32/“high” is fine on NVIDIA
+'''

@@ -1,3 +1,4 @@
+'''
 # PPO config tuned for Pendulum-v1 (continuous)
 env_id: Pendulum-v1
 seed: 1
@@ -35,3 +36,4 @@ reward_scale: 1.0          # keep returns interpretable; can try 0.5 if loss exp
 # perf
 use_compile: false         # enable if compile works well on your box
 float32_matmul_precision: "high"
+''''

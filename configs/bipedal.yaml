@@ -1,3 +1,4 @@
+'''
 # PPO config for BipedalWalker-v3 (CONTINUOUS)
 # This task is harder; allocate more steps or scale up model if needed
 env_id: BipedalWalker-v3
@@ -34,3 +35,4 @@ use_compile: false
 
 # Model — can bump to [128,128] if you have GPU budget
 hidden_sizes: [64, 64]
+'''

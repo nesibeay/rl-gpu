@@ -1,3 +1,4 @@
+'''
 env_id: Pendulum-v1
 seed: 1
 total_timesteps: 300000
@@ -30,3 +31,4 @@ use_value_clip: true
 use_compile: false
 float32_matmul_precision: high
 init_log_std: -0.3063337965289385
+'''

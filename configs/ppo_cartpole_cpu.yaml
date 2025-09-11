@@ -28,3 +28,6 @@ use_tanh_squash: false # Does not apply to discrete actions
 target_kl: 0.015
 use_compile: false
 float32_matmul_precision: high
+
+device: cpu # Explicitly specify CPU usage for Colab
+use_amp: false        # you’re on CPU; keep false (true on CUDA)

@@ -33,3 +33,7 @@ use_value_clip: true
 adv_norm: true
 use_tanh_squash: true
 target_kl: 0.02
+
+
+device: cpu # Explicitly specify CPU usage for Colab
+use_amp: false        # you’re on CPU; keep false (true on CUDA)
