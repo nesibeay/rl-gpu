@@ -1,0 +1,30 @@
+#*File: `configs/ppo_bipedalwalker_hw_gpu.yaml`**
+
+env_id: BipedalWalker-v3
+seed: 1
+total_timesteps: 1000000
+device: cuda
+use_compile: true
+use_amp: true
+num_envs: 256
+rollout_steps: 1024
+minibatch_size: 4096
+actor_hidden_sizes: [256, 256]
+critic_hidden_sizes: [256, 256]
+n_epochs: 20
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+vf_clip_coef: 0.2
+ent_coef: 0.001
+vf_coef: 0.5
+max_grad_norm: 1.0
+activation: tanh
+lr: 0.001
+lr_anneal: linear
+reward_scale: 0.1
+obs_norm: true
+use_value_clip: true
+adv_norm: true
+use_tanh_squash: true
+target_kl: 0.02
