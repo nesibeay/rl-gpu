@@ -28,3 +28,4 @@ use_value_clip: true
 adv_norm: true
 use_tanh_squash: true
 target_kl: 0.02
+float32_matmul_precision: high
