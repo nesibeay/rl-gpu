@@ -6,7 +6,6 @@ seed: 1
 num_envs: 16          # total batch = num_envs * rollout_steps = 2048
 rollout_steps: 128
 n_epochs: 4           # fewer epochs prevents overfitting small batches
-minibatch_size: 256
 
 # RL coefficients
 gamma: 0.99

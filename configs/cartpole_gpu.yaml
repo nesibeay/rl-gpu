@@ -1,0 +1,32 @@
+# === CartPole-v1 - GPU Accelerated (Forced High Workload) ===
+# NOTE: We are creating an artificial workload to overcome overheads.
+env_id: CartPole-v1
+seed: 1
+total_timesteps: 50000
+
+# --- WORKLOAD & DEVICE (SCALED FOR GPU) ---
+device: cuda
+use_compile: true
+float32_matmul_precision: high
+num_envs: 1024                # Massive parallelism is the ONLY way to see speedup here
+actor_hidden_sizes: [256, 256]  # Artificially large network to create GPU work
+critic_hidden_sizes: [256, 256]
+
+# --- LEARNING PARAMETERS (KEPT IDENTICAL FOR FAIRNESS) ---
+rollout_steps: 128
+n_epochs: 4
+minibatch_size: 16384          # Large minibatch for GPU
+gamma: 0.99
+gae_lambda: 0.98
+clip_coef: 0.2
+vf_coef: 0.5
+ent_coef: 0.01
+max_grad_norm: 0.5
+activation: tanh
+lr: 0.0005
+lr_anneal: ""
+
+# --- STABILIZERS ---
+adv_norm: true
+use_value_clip: false
+obs_norm: false

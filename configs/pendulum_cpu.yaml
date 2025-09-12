@@ -1,0 +1,33 @@
+# === Pendulum-v1 - CPU Baseline (Optimized for Learning) ===
+env_id: Pendulum-v1
+seed: 1
+total_timesteps: 300000
+
+# --- WORKLOAD & DEVICE ---
+device: cpu
+num_envs: 32                  # Solid parallelism for a multi-core CPU
+actor_hidden_sizes: [128, 128]  # Sufficiently large network to learn well
+critic_hidden_sizes: [128, 128]
+
+# --- LEARNING PARAMETERS ---
+rollout_steps: 256
+n_epochs: 10
+minibatch_size: 1024
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+vf_clip_coef: 0.2
+ent_coef: 0.001
+vf_coef: 0.5
+max_grad_norm: 1.0
+activation: tanh
+lr: 0.001
+lr_anneal: linear
+
+# --- STABILIZERS ---
+reward_scale: 0.1             # Key for Pendulum
+obs_norm: true
+adv_norm: true
+use_value_clip: true
+use_tanh_squash: true
+target_kl: 0.02

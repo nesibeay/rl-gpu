@@ -1,0 +1,32 @@
+# === BipedalWalker-v3 - CPU Baseline (Optimized for Learning) ===
+env_id: BipedalWalker-v3
+seed: 1
+total_timesteps: 1000000
+
+# --- WORKLOAD & DEVICE ---
+device: cpu
+num_envs: 16                  # Low parallelism due to heavy CPU simulation load
+actor_hidden_sizes: [256, 256]
+critic_hidden_sizes: [256, 256]
+
+# --- LEARNING PARAMETERS ---
+rollout_steps: 2048
+n_epochs: 10
+minibatch_size: 2048
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+vf_clip_coef: 0.2
+ent_coef: 0.001
+vf_coef: 0.5
+max_grad_norm: 0.5
+activation: tanh
+lr: 0.0003
+lr_anneal: linear
+
+# --- STABILIZERS ---
+obs_norm: true
+adv_norm: true
+use_value_clip: true
+use_tanh_squash: true
+target_kl: 0.015

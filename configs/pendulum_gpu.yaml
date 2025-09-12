@@ -1,0 +1,35 @@
+# === Pendulum-v1 - GPU Accelerated (Balanced Workload) ===
+env_id: Pendulum-v1
+seed: 1
+total_timesteps: 300000
+
+# --- WORKLOAD & DEVICE (SCALED FOR GPU) ---
+device: cuda
+use_compile: true
+float32_matmul_precision: high
+num_envs: 256                 # 8x parallelism to feed the GPU
+actor_hidden_sizes: [512, 512]  # 16x larger network to create significant GPU work
+critic_hidden_sizes: [512, 512]
+
+# --- LEARNING PARAMETERS (KEPT IDENTICAL FOR FAIRNESS) ---
+rollout_steps: 256
+n_epochs: 10
+minibatch_size: 16384          # Larger minibatch to leverage GPU memory bandwidth
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+vf_clip_coef: 0.2
+ent_coef: 0.001
+vf_coef: 0.5
+max_grad_norm: 1.0
+activation: tanh
+lr: 0.001
+lr_anneal: linear
+
+# --- STABILIZERS ---
+reward_scale: 0.1
+obs_norm: true
+adv_norm: true
+use_value_clip: true
+use_tanh_squash: true
+target_kl: 0.02
