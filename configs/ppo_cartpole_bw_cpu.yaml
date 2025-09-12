@@ -1,0 +1,31 @@
+# === CartPole - Balanced Workload (BW) - CPU Baseline ===
+env_id: CartPole-v1
+seed: 1
+total_timesteps: 100000
+
+# --- CPU-SPECIFIC SETTINGS ---
+device: cpu
+use_compile: false
+use_amp: false
+num_envs: 16
+
+# --- LEARNING PARAMETERS (Proven to work for CartPole) ---
+rollout_steps: 128
+n_epochs: 10
+minibatch_size: 512
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+vf_clip_coef: 0.2
+ent_coef: 0.01
+vf_coef: 0.5
+max_grad_norm: 0.5
+actor_hidden_sizes: [64, 64] # A smaller network is sufficient
+critic_hidden_sizes: [64, 64]
+activation: tanh
+lr: 0.0003
+lr_anneal: linear
+use_value_clip: true
+adv_norm: true
+use_tanh_squash: false
+target_kl: 0.015
