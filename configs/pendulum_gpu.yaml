@@ -1,4 +1,4 @@
-# === Pendulum-v1 - GPU Accelerated (Balanced Workload) ===
+# === Pendulum-v1 - GPU Accelerated (v2 - Tuned for Stability) ===
 env_id: Pendulum-v1
 seed: 1
 total_timesteps: 300000
@@ -7,14 +7,14 @@ total_timesteps: 300000
 device: cuda
 use_compile: true
 float32_matmul_precision: high
-num_envs: 256                 # 8x parallelism to feed the GPU
-actor_hidden_sizes: [512, 512]  # 16x larger network to create significant GPU work
+num_envs: 256
+actor_hidden_sizes: [512, 512]
 critic_hidden_sizes: [512, 512]
 
-# --- LEARNING PARAMETERS (KEPT IDENTICAL FOR FAIRNESS) ---
+# --- LEARNING PARAMETERS (TUNED FOR LARGER NETWORK) ---
 rollout_steps: 256
-n_epochs: 10
-minibatch_size: 16384          # Larger minibatch to leverage GPU memory bandwidth
+n_epochs: 20                  # <-- CHANGE: Increased epochs for better learning on the large batch
+minibatch_size: 16384
 gamma: 0.99
 gae_lambda: 0.95
 clip_coef: 0.2
@@ -23,7 +23,7 @@ ent_coef: 0.001
 vf_coef: 0.5
 max_grad_norm: 1.0
 activation: tanh
-lr: 0.001
+lr: 0.0003                   # <-- CHANGE: Reduced LR for stability with the large network
 lr_anneal: linear
 
 # --- STABILIZERS ---

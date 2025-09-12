@@ -1,4 +1,4 @@
-# === BipedalWalker-v3 - GPU Accelerated (Balanced Workload) ===
+# === BipedalWalker-v3 - GPU Accelerated (v2 - Tuned for Stability) ===
 env_id: BipedalWalker-v3
 seed: 1
 total_timesteps: 1000000
@@ -7,14 +7,14 @@ total_timesteps: 1000000
 device: cuda
 use_compile: true
 float32_matmul_precision: high
-num_envs: 64                  # 4x parallelism: a careful increase to avoid CPU bottleneck
-actor_hidden_sizes: [512, 512]  # Larger network is the main source of GPU workload here
+num_envs: 64
+actor_hidden_sizes: [512, 512]
 critic_hidden_sizes: [512, 512]
 
-# --- LEARNING PARAMETERS (KEPT IDENTICAL FOR FAIRNESS) ---
+# --- LEARNING PARAMETERS (TUNED FOR LARGER NETWORK) ---
 rollout_steps: 2048
-n_epochs: 10
-minibatch_size: 16384          # Larger minibatch for GPU efficiency
+n_epochs: 20                  # <-- CHANGE: Increased epochs for this difficult environment
+minibatch_size: 16384
 gamma: 0.99
 gae_lambda: 0.95
 clip_coef: 0.2
@@ -23,7 +23,7 @@ ent_coef: 0.001
 vf_coef: 0.5
 max_grad_norm: 0.5
 activation: tanh
-lr: 0.0003
+lr: 0.0003                   # The LR was already good, keeping it.
 lr_anneal: linear
 
 # --- STABILIZERS ---
